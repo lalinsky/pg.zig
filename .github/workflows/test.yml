@@ -28,19 +28,9 @@ jobs:
 
       - name: Wait for PostgreSQL to be ready
         run: |
-          echo "Waiting for PostgreSQL to be ready..."
-          for i in {1..30}; do
-            if docker compose exec -T postgres psql -U postgres -c "SHOW ssl" 2>&1 | grep -q "on"; then
-              echo "PostgreSQL is ready with SSL enabled!"
-              sleep 10
-              exit 0
-            fi
-            echo "Attempt $i/30: Waiting for initialization to complete..."
-            sleep 2
-          done
-          echo "PostgreSQL failed to become ready in time"
-          docker compose logs postgres
-          exit 1
+          echo "Waiting for PostgreSQL to be healthy..."
+          timeout 120 bash -c 'until docker compose ps postgres | grep -q "healthy"; do sleep 2; done'
+          echo "PostgreSQL is ready!"
         working-directory: tests
 
       - name: Run tests
