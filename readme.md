@@ -27,7 +27,13 @@ exe.root_module.addImport("pg", pg.module("pg"));
 
 ## Example
 ```zig
-var pool = try pg.Pool.init(allocator, .{
+const pg = @import("pg");
+const zio = @import("zio");
+
+const rt = try zio.Runtime.init(allocator, .{});
+defer rt.deinit();
+
+var pool = try pg.Pool.init(allocator, rt, .{
   .size = 5,
   .connect = .{
     .port = 5432,
@@ -37,7 +43,7 @@ var pool = try pg.Pool.init(allocator, .{
     .username = "postgres",
     .database = "postgres",
     .password = "postgres",
-    .timeout = 10_000,
+    .timeout = .{ .duration = .fromSeconds(10) },
   }
 });
 defer pool.deinit();
@@ -55,7 +61,7 @@ while (try result.next()) |row| {
 ## Pool
 The pool keeps a configured number of database connection open. The `acquire()` method is used to retrieve a connection from the pool. The pool may start one background thread to attempt to reconnect disconnected connections (or connections which are in an invalid state).
 
-### init(allocator: std.mem.allocator, opts: Opts) !*Pool
+### init(allocator: std.mem.allocator, rt: *zio.Runtime, opts: Opts) !*Pool
 Initializes a connection pool. Pool options are:
 
 * `size` - Number of connections to maintain. Defaults to `10`
@@ -64,12 +70,15 @@ Initializes a connection pool. Pool options are:
 * `timeout`: - The amount of time, in milliseconds, to wait for a connection to be available when `acquire()` is called.
 * `connect_on_init_count`:  - The # of connections in the pool to eagerly connect during `init`. Defaults to `null` which will initiliaze all connections (`size`). The background reconnector is used to setup the remaining (`size - connect_on_init_count`) connections. This can be set to `0`, to prevent `init` from failing except in extreme cases (i.e. OOM), but that will hide any configuration/connection issue until the first query is executed.
 
-### initUri(allocator: std.mem.Allocator, uri: std.Uri, opts: Opts) !*Pool
+### initUri(allocator: std.mem.Allocator, rt: *zio.Runtime, uri: std.Uri, opts: Opts) !*Pool
 Initializes a connection pool using a std.Uri. When using this function, the `auth` and `connect` fields of `opts` should **not** be set, as these will automatically set based on the provided `uri`.
 
 ```zig
 const uri = try std.Uri.parse("postgresql://username:password@localhost:5432/database_name");
-const pool = try pg.Pool.initUri(allocator, uri, 5, 10_000);
+const pool = try pg.Pool.initUri(allocator, rt, uri, .{
+  .size = 5,
+  .timeout = 10_000,
+});
 defer pool.deinit();
 ```
 
@@ -100,7 +109,7 @@ For single-query operations, the pool offers wrappers around the connection's `e
 
 ## Conn
 
-### open(allocator: std.mem.Allocator, opts: Opts) !Conn
+### open(allocator: std.mem.Allocator, rt: *zio.Runtime, opts: Opts) !Conn
 Opens a connection, or returns an error. Prefer creating connections through the pool. Connection options are:
 
 * `host` - Defaults to `"127.0.0.1"`
@@ -118,7 +127,7 @@ Authentications the request. Prefer creating connections through the pool. Auth 
 * `username`: Defaults to `"postgres"`
 * `password`: Defaults to `null`
 * `database`: Defaults to `null`
-* `timeout` : Defaults to `10_000` (milliseconds)
+* `timeout` : Defaults to `.{ .duration = .fromSeconds(10) }`. Use `.none` for no timeout.
 * `application_name`: Defaults to `null`
 * `params`: Defaults to `null`. An `std.StringHashMap([]const u8)`
 
@@ -134,7 +143,7 @@ Executes the query with arguments, returns [Result](#result). `deinit`, and poss
 ### queryOpts(sql: []const u8, args: anytype, opts: Conn.QueryOpts) !Result
 Same as `query` but takes options:
 
-- `timeout: ?u32` - This is not reliable and should probably not be used. Currently it simply puts a recv socket timeout. On timeout, the connection will likely no longer be valid (which the pool will detect and handle when the connection is released) and the underlying query will likely still execute. Defaults to `null`
+- `timeout: zio.Timeout` - This is not reliable and should probably not be used. Currently it simply puts a recv socket timeout. On timeout, the connection will likely no longer be valid (which the pool will detect and handle when the connection is released) and the underlying query will likely still execute. Defaults to `.none`
 - `column_names: bool` - Whether or not the `result.column_names` should be populated. When true, this requires memory allocation (duping the column names). Defaults to `false` unless the `column_names` build option was set to true.
 - `allocator` - The allocator to use for any allocations needed when executing the query and reading the results. When `null` this will default to the connection's allocator. If you were executing a query in a web-request and each web-request had its own arena tied to the lifetime of the request, it might make sense to use that arena. Defaults to `null`.
 - `release_conn: bool` - Whether or not to call `conn.release()` when `result.deinit()` is called. Useful for writing a function that acquires a connection from a `Pool` and returns a `Result`. When `query` or `row` are called from a `Pool` this is forced to `true`. Otherwise, defaults to `false`. 
@@ -540,7 +549,7 @@ Creating a new Listener directly is a lot like creating a new connection. See [C
 
 ```zig
 // see the Conn.ConnectOpts
-var listener = try pg.Listener.open(allocator, .{
+var listener = try pg.Listener.open(allocator, rt, .{
   .host = "127.0.0.1",
   .port = 5432,
 });
@@ -640,7 +649,7 @@ When not specified, the system defaults are use for the library and include path
 Set the connection's `tls` option to either `.required` or `.{verify_full = null}`. When using a custom root certificate, specify the path: `.{verify_full = "/path/to/root.crt"}`.
 
 ```zig
-var pool = try pg.Pool.init(allocator, .{
+var pool = try pg.Pool.init(allocator, rt, .{
   .connect = .{ .port = 5432, .host = "ip_or_hostname", .tls = .{.verify_full = null}},
   .auth = .{ .... },
   .size = 5,
@@ -648,7 +657,10 @@ var pool = try pg.Pool.init(allocator, .{
 
 // OR
 const uri = try std.Uri.parse("postgresql://user:password@hostname/DBNAME?sslmode=require");
-var pool = try pg.Pool.initUri(allocator, uri, 10, 5_000);
+var pool = try pg.Pool.initUri(allocator, rt, uri, .{
+  .size = 10,
+  .timeout = 5_000,
+});
 ```
 
 In your main file, you can define a global `pub const pg_stderr_tls = true;` to have pg.zig print possible TLS-related errors to stderr. Alternatively, if you get an error, you `pg.printSSLError();` to hopefully print an error message to stderr which can be included in a ticket. This can safely be called in a `catch` clause, and will display nothing if the error is NOT SSL-related. Note that using the global `pg_stderr_tls` is more likely to print useful information in the case of certification verification problems.
