@@ -1,6 +1,7 @@
 const std = @import("std");
 const lib = @import("lib.zig");
 const Buffer = @import("buffer").Buffer;
+const zio = @import("zio");
 
 const proto = lib.proto;
 const Conn = lib.Conn;
@@ -88,7 +89,7 @@ pub const Listener = struct {
     }
 
     const ListenOpts = struct {
-        timeout: u32 = 0,
+        timeout: zio.Timeout = .none,
     };
     pub fn listen(self: *Listener, channel: []const u8, opts: ListenOpts) !void {
         // LISTEN doesn't support parameterized queries. It has to be a simple query.
@@ -223,19 +224,23 @@ test "Listener: from Pool" {
 }
 
 fn testListener(l: *Listener) !void {
-    var reset: std.Thread.ResetEvent = .{};
-    var tt = try std.Thread.spawn(.{}, struct {
-        fn shutdown(ll: *Listener, r: *std.Thread.ResetEvent) void {
-            r.wait();
+    var reset = zio.ResetEvent.init;
+
+    var group = zio.Group.init;
+    defer group.cancel();
+
+    try group.spawn(struct {
+        fn shutdown(ll: *Listener, r: *zio.ResetEvent) !void {
+            try r.wait();
             ll.stop();
         }
     }.shutdown, .{ l, &reset });
-    tt.detach();
 
     try l.listen("chan-1", .{});
     try l.listen("chan_2", .{});
 
-    const thrd = try std.Thread.spawn(.{}, testNotifier, .{});
+    try group.spawn(testNotifier, .{});
+
     {
         const notification = l.next().?;
         try t.expectString("chan-1", notification.channel);
@@ -256,7 +261,7 @@ fn testListener(l: *Listener) !void {
 
     reset.set();
     try t.expectEqual(null, l.next());
-    thrd.join();
+    try group.wait();
 }
 
 fn testNotifier() void {

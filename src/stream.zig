@@ -1,5 +1,6 @@
 const std = @import("std");
 const lib = @import("lib.zig");
+const zio = @import("zio");
 
 const openssl = lib.openssl;
 
@@ -16,76 +17,83 @@ const TLSStream = struct {
     valid: bool,
     ssl: ?*openssl.SSL,
     socket: posix.socket_t,
+    timeout: zio.time.Timeout,
 
     pub fn connect(allocator: Allocator, opts: Conn.Opts, ctx_: ?*openssl.SSL_CTX) !Stream {
-        const plain = try PlainStream.connect(allocator, opts, null);
-        errdefer plain.close();
+        _ = allocator;
+        _ = opts;
+        _ = ctx_;
+        // TODO: Implement TLS with zio using BIO pairs
+        return error.TLSNotYetImplemented;
 
-        const socket = plain.socket;
-
-        var ssl: ?*openssl.SSL = null;
-        if (ctx_) |ctx| {
-            // PostgreSQL TLS starts off as a plain connection which we upgrade
-            try writeSocket(socket, &.{ 0, 0, 0, 8, 4, 210, 22, 47 });
-            var buf = [1]u8{0};
-            _ = try readSocket(socket, &buf);
-            if (buf[0] != 'S') {
-                return error.SSLNotSupportedByServer;
-            }
-
-            ssl = openssl.SSL_new(ctx) orelse return error.SSLNewFailed;
-            errdefer openssl.SSL_free(ssl);
-
-            if (opts.host) |host| {
-                if (isHostName(host)) {
-                    // don't send this for an ip address
-                    var owned = false;
-                    const h = opts._hostz orelse blk: {
-                        owned = true;
-                        break :blk try allocator.dupeZ(u8, host);
-                    };
-
-                    defer if (owned) {
-                        allocator.free(h);
-                    };
-
-                    if (openssl.SSL_set_tlsext_host_name(ssl, h.ptr) != 1) {
-                        return error.SSLHostNameFailed;
-                    }
-                }
-                switch (opts.tls) {
-                    .verify_full => openssl.SSL_set_verify(ssl, openssl.SSL_VERIFY_PEER, null),
-                    else => {},
-                }
-            }
-
-            if (openssl.SSL_set_fd(ssl, if (@import("builtin").os.tag == .windows) @intCast(@intFromPtr(socket)) else socket) != 1) {
-                return error.SSLSetFdFailed;
-            }
-
-            {
-                const ret = openssl.SSL_connect(ssl);
-                if (ret != 1) {
-                    const verification_code = openssl.SSL_get_verify_result(ssl);
-                    if (comptime lib._stderr_tls) {
-                        lib.printSSLError();
-                    }
-                    if (verification_code != openssl.X509_V_OK) {
-                        if (comptime lib._stderr_tls) {
-                            std.debug.print("ssl verification error: {s}\n", .{openssl.X509_verify_cert_error_string(verification_code)});
-                        }
-                        return error.SSLCertificationVerificationError;
-                    }
-                    return error.SSLConnectFailed;
-                }
-            }
-        }
-
-        return .{
-            .ssl = ssl,
-            .valid = true,
-            .socket = socket,
-        };
+        // const plain = try PlainStream.connect(allocator, opts, null);
+        // errdefer plain.close();
+        //
+        // const socket = plain.socket;
+        //
+        // var ssl: ?*openssl.SSL = null;
+        // if (ctx_) |ctx| {
+        //     // PostgreSQL TLS starts off as a plain connection which we upgrade
+        //     try writeSocket(socket, &.{ 0, 0, 0, 8, 4, 210, 22, 47 });
+        //     var buf = [1]u8{0};
+        //     _ = try readSocket(socket, &buf);
+        //     if (buf[0] != 'S') {
+        //         return error.SSLNotSupportedByServer;
+        //     }
+        //
+        //     ssl = openssl.SSL_new(ctx) orelse return error.SSLNewFailed;
+        //     errdefer openssl.SSL_free(ssl);
+        //
+        //     if (opts.host) |host| {
+        //         if (isHostName(host)) {
+        //             // don't send this for an ip address
+        //             var owned = false;
+        //             const h = opts._hostz orelse blk: {
+        //                 owned = true;
+        //                 break :blk try allocator.dupeZ(u8, host);
+        //             };
+        //
+        //             defer if (owned) {
+        //                 allocator.free(h);
+        //             };
+        //
+        //             if (openssl.SSL_set_tlsext_host_name(ssl, h.ptr) != 1) {
+        //                 return error.SSLHostNameFailed;
+        //             }
+        //         }
+        //         switch (opts.tls) {
+        //             .verify_full => openssl.SSL_set_verify(ssl, openssl.SSL_VERIFY_PEER, null),
+        //             else => {},
+        //         }
+        //     }
+        //
+        //     if (openssl.SSL_set_fd(ssl, if (@import("builtin").os.tag == .windows) @intCast(@intFromPtr(socket)) else socket) != 1) {
+        //         return error.SSLSetFdFailed;
+        //     }
+        //
+        //     {
+        //         const ret = openssl.SSL_connect(ssl);
+        //         if (ret != 1) {
+        //             const verification_code = openssl.SSL_get_verify_result(ssl);
+        //             if (comptime lib._stderr_tls) {
+        //                 lib.printSSLError();
+        //             }
+        //             if (verification_code != openssl.X509_V_OK) {
+        //                 if (comptime lib._stderr_tls) {
+        //                     std.debug.print("ssl verification error: {s}\n", .{openssl.X509_verify_cert_error_string(verification_code)});
+        //                 }
+        //                 return error.SSLCertificationVerificationError;
+        //             }
+        //             return error.SSLConnectFailed;
+        //         }
+        //     }
+        // }
+        //
+        // return .{
+        //     .ssl = ssl,
+        //     .valid = true,
+        //     .socket = socket,
+        // };
     }
 
     pub fn close(self: *Stream) void {
@@ -97,6 +105,10 @@ const TLSStream = struct {
             openssl.SSL_free(ssl);
         }
         posix.close(self.socket);
+    }
+
+    pub fn setTimeout(self: *Stream, timeout: zio.time.Timeout) void {
+        self.timeout = timeout;
     }
 
     pub fn writeAll(self: *Stream, data: []const u8) !void {
@@ -127,37 +139,50 @@ const TLSStream = struct {
 };
 
 const PlainStream = struct {
-    socket: posix.socket_t,
+    stream: zio.net.Stream,
+    timeout: zio.time.Timeout,
 
     pub fn connect(allocator: Allocator, opts: Conn.Opts, _: anytype) !PlainStream {
-        const socket = blk: {
+        _ = allocator;
+        const stream = blk: {
             const host = opts.host orelse DEFAULT_HOST;
             if (host.len > 0 and host[0] == '/') {
-                if (comptime std.net.has_unix_sockets == false or std.posix.AF == void) {
-                    return error.UnixPathNotSupported;
-                }
-                break :blk (try std.net.connectUnixSocket(host)).handle;
+                const addr = try zio.net.UnixAddress.init(host);
+                break :blk try addr.connect(.{});
             }
             const port = opts.port orelse 5432;
-            break :blk (try std.net.tcpConnectToHost(allocator, host, port)).handle;
+
+            // Try to parse as IP address first
+            if (zio.net.IpAddress.parseIp4(host, port)) |addr| {
+                break :blk try addr.connect(.{});
+            } else |_| {
+                // Fall back to hostname resolution
+                const hostname = try zio.net.HostName.init(host);
+                break :blk try hostname.connect(port, .{});
+            }
         };
-        errdefer posix.close(socket);
+        errdefer stream.close();
 
         return .{
-            .socket = socket,
+            .stream = stream,
+            .timeout = .none,
         };
     }
 
     pub fn close(self: *const PlainStream) void {
-        posix.close(self.socket);
+        self.stream.close();
+    }
+
+    pub fn setTimeout(self: *PlainStream, timeout: zio.time.Timeout) void {
+        self.timeout = timeout;
     }
 
     pub fn writeAll(self: *const PlainStream, data: []const u8) !void {
-        return writeSocket(self.socket, data);
+        return self.stream.writeAll(data, .none);
     }
 
     pub fn read(self: *const PlainStream, buf: []u8) !usize {
-        return readSocket(self.socket, buf);
+        return self.stream.read(buf, self.timeout);
     }
 };
 

@@ -1,6 +1,7 @@
 const std = @import("std");
 const lib = @import("lib.zig");
 const Buffer = @import("buffer").Buffer;
+const zio = @import("zio");
 
 const proto = lib.proto;
 const types = lib.types;
@@ -94,13 +95,13 @@ pub const Conn = struct {
         username: []const u8 = "postgres",
         password: ?[]const u8 = null,
         database: ?[]const u8 = null,
-        timeout: u32 = 10_000,
+        timeout: zio.Timeout = .{ .duration = .fromMilliseconds(10_000) },
         application_name: ?[]const u8 = null,
         startup_parameters: ?std.StringHashMap([]const u8) = null,
     };
 
     pub const QueryOpts = struct {
-        timeout: ?u32 = null,
+        timeout: zio.Timeout = .none,
         column_names: bool = lib.default_column_names,
 
         allocator: ?Allocator = null,
@@ -1892,6 +1893,8 @@ test "open URI" {
 }
 
 test "Conn: TLS required" {
+    if (!lib.has_openssl) return error.SkipZigTest;
+
     {
         var conn = try Conn.open(t.allocator, .{ .tls = .off });
         defer conn.deinit();
@@ -1906,6 +1909,8 @@ test "Conn: TLS required" {
 }
 
 test "Conn: TLS verify-full" {
+    if (!lib.has_openssl) return error.SkipZigTest;
+
     try t.expectError(error.SSLCertificationVerificationError, Conn.open(t.allocator, .{ .tls = .{ .verify_full = null } }));
 
     {

@@ -160,7 +160,7 @@ pub fn parseOpts(uri: std.Uri, allocator: std.mem.Allocator) !ParsedOpts {
             .username = username,
             .password = password,
             .database = if (path.len == 0) null else path,
-            .timeout = tcp_user_timeout orelse 10_000,
+            .timeout = if (tcp_user_timeout) |ms| .{ .duration = .fromMilliseconds(ms) } else .{ .duration = .fromMilliseconds(10_000) },
         },
         .connect = .{
             .tls = tls,
@@ -261,7 +261,7 @@ const valid_tcs: [2]TestCase = .{
         .username = "user",
         .password = "pass",
         .database = "somedb",
-        .timeout = 5678,
+        .timeout = .{ .duration = .fromMilliseconds(5678) },
     }, .connect = .{
         .host = "somehost",
         .port = 1234,

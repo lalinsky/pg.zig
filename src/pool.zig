@@ -1,5 +1,6 @@
 const std = @import("std");
 const lib = @import("lib.zig");
+const zio = @import("zio");
 
 const log = lib.log;
 const Conn = lib.Conn;
@@ -8,7 +9,6 @@ const SSLCtx = lib.SSLCtx;
 const QueryRow = lib.QueryRow;
 const Listener = @import("listener.zig").Listener;
 
-const Thread = std.Thread;
 const Allocator = std.mem.Allocator;
 
 pub const Pool = struct {
@@ -18,8 +18,8 @@ pub const Pool = struct {
     _available: usize,
     _missing: usize,
     _allocator: Allocator,
-    _mutex: Thread.Mutex,
-    _cond: Thread.Condition,
+    _mutex: zio.Mutex,
+    _cond: zio.Condition,
     _ssl_ctx: ?*lib.SSLCtx,
     _reconnector: Reconnector,
     _arena: std.heap.ArenaAllocator,
@@ -122,7 +122,7 @@ pub const Pool = struct {
         const conns = self._conns;
         const deadline = std.time.nanoTimestamp() + @as(i64, @intCast(self._timeout));
 
-        self._mutex.lock();
+        try self._mutex.lock();
         errdefer self._mutex.unlock();
 
         while (true) {
@@ -145,7 +145,7 @@ pub const Pool = struct {
                 }
                 const remaining_ns: u64 = @intCast(deadline - now);
 
-                try self._cond.timedWait(&self._mutex, remaining_ns);
+                try self._cond.timedWait(&self._mutex, .fromNanoseconds(remaining_ns));
                 continue;
             }
 
@@ -172,7 +172,7 @@ pub const Pool = struct {
             conn_to_add = newConnection(self, true) catch |err1| {
                 // we failed to create the connection, track it as missing and let
                 // the background reconnector try
-                self._mutex.lock();
+                self._mutex.lockUncancelable();
                 self._missing += 1;
                 self._mutex.unlock();
 
@@ -184,7 +184,7 @@ pub const Pool = struct {
         }
 
         var conns = self._conns;
-        self._mutex.lock();
+        self._mutex.lockUncancelable();
         const available = self._available;
         conns[available] = conn_to_add;
         self._available = available + 1;
@@ -199,7 +199,7 @@ pub const Pool = struct {
     }
 
     pub fn stats(self: *Pool) Stats {
-        self._mutex.lock();
+        self._mutex.lockUncancelable();
         defer self._mutex.unlock();
 
         const available = self._available;
@@ -249,78 +249,54 @@ pub const Pool = struct {
 };
 
 const Reconnector = struct {
-    // number of connections that the pool is missing, i.e. how many need to be
-    // reconnected
-    count: usize,
-
-    // when stop is called, this is set to true
-    stopped: bool,
+    // number of connections that need to be reconnected
+    count: std.atomic.Value(usize),
 
     pool: *Pool,
-    mutex: Thread.Mutex,
-
-    // the thread, if any, that the monitor is running in
-    thread: ?Thread,
+    group: zio.Group,
 
     fn init(pool: *Pool) Reconnector {
         return .{
             .pool = pool,
-            .count = 0,
-            .mutex = .{},
-            .stopped = false,
-            .thread = null,
+            .count = std.atomic.Value(usize).init(0),
+            .group = zio.Group.init,
         };
     }
 
-    fn run(self: *Reconnector) void {
+    fn run(self: *Reconnector) !void {
         const pool = self.pool;
-        const retry_delay = 2 * std.time.ns_per_s;
+        const retry_delay = zio.time.Duration.fromSeconds(2);
 
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        loop: while (self.count > 0) {
-            const stopped = self.stopped;
-            self.mutex.unlock();
-            if (stopped == true) {
-                return;
-            }
-
-            const conn = newConnection(pool, false) catch {
-                std.Thread.sleep(retry_delay);
-                self.mutex.lock();
-                continue :loop;
+        while (true) {
+            const conn = newConnection(pool, false) catch |err| {
+                if (err == error.Canceled) return error.Canceled;
+                try zio.sleep(retry_delay);
+                continue;
             };
 
             // Decrement missing count when successfully recreated
-            pool._mutex.lock();
+            pool._mutex.lockUncancelable();
             std.debug.assert(pool._missing > 0);
             pool._missing -= 1;
             pool._mutex.unlock();
 
             conn.release(); // inserts it into the pool
-            self.mutex.lock();
-            self.count -= 1;
-        }
 
-        self.thread.?.detach();
-        self.thread = null;
+            // Decrement count and check if we're done
+            if (self.count.fetchSub(1, .acq_rel) == 1) {
+                return;
+            }
+        }
     }
 
     fn stop(self: *Reconnector) void {
-        self.mutex.lock();
-        self.stopped = true;
-        self.mutex.unlock();
-        if (self.thread) |thrd| {
-            thrd.join();
-        }
+        self.group.cancel();
     }
 
     fn reconnect(self: *Reconnector) !void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        self.count += 1;
-        if (self.thread == null) {
-            self.thread = try Thread.spawn(.{ .stack_size = 1024 * 1024 }, Reconnector.run, .{self});
+        const prev = self.count.fetchAdd(1, .acq_rel);
+        if (prev == 0) {
+            try self.group.spawn(Reconnector.run, .{self});
         }
     }
 };
@@ -373,13 +349,12 @@ test "Pool" {
         , .{});
     }
 
-    const t1 = try std.Thread.spawn(.{}, testPool, .{pool});
-    const t2 = try std.Thread.spawn(.{}, testPool, .{pool});
-    const t3 = try std.Thread.spawn(.{}, testPool, .{pool});
-
-    t1.join();
-    t2.join();
-    t3.join();
+    var group = zio.Group.init;
+    defer group.cancel();
+    try group.spawn(testPool, .{pool});
+    try group.spawn(testPool, .{pool});
+    try group.spawn(testPool, .{pool});
+    try group.wait();
 
     {
         const c1 = try pool.acquire();
@@ -525,10 +500,10 @@ test "Pool: Row error" {
     try t.expectEqual(1, pool._available);
 }
 
-fn testPool(p: *Pool) void {
+fn testPool(p: *Pool) !void {
     for (0..500) |i| {
-        const conn = p.acquire() catch unreachable;
-        _ = conn.exec("insert into pool_test (id) values ($1)", .{i}) catch unreachable;
+        const conn = try p.acquire();
+        _ = try conn.exec("insert into pool_test (id) values ($1)", .{i});
         conn.release();
     }
 }
