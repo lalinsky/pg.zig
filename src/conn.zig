@@ -96,13 +96,13 @@ pub const Conn = struct {
         username: []const u8 = "postgres",
         password: ?[]const u8 = null,
         database: ?[]const u8 = null,
-        timeout: u32 = 10_000,
+        timeout: zio.Timeout = .{ .duration = .fromMilliseconds(10_000) },
         application_name: ?[]const u8 = null,
         startup_parameters: ?std.StringHashMap([]const u8) = null,
     };
 
     pub const QueryOpts = struct {
-        timeout: ?u32 = null,
+        timeout: zio.Timeout = .none,
         column_names: bool = lib.default_column_names,
 
         allocator: ?Allocator = null,
