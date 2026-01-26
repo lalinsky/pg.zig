@@ -30,11 +30,11 @@ jobs:
         run: |
           echo "Waiting for PostgreSQL to be ready..."
           for i in {1..30}; do
-            if docker compose exec -T postgres pg_isready -U postgres > /dev/null 2>&1; then
-              echo "PostgreSQL is ready!"
+            if docker compose exec -T postgres psql -U postgres -c "SHOW ssl" 2>&1 | grep -q "on"; then
+              echo "PostgreSQL is ready with SSL enabled!"
               exit 0
             fi
-            echo "Attempt $i/30: PostgreSQL not ready yet, waiting..."
+            echo "Attempt $i/30: Waiting for initialization to complete..."
             sleep 2
           done
           echo "PostgreSQL failed to become ready in time"
