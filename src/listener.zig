@@ -91,7 +91,7 @@ pub const Listener = struct {
     }
 
     const ListenOpts = struct {
-        timeout: ?u32 = null,
+        timeout: zio.Timeout = .none,
     };
     pub fn listen(self: *Listener, channel: []const u8, opts: ListenOpts) !void {
         // LISTEN doesn't support parameterized queries. It has to be a simple query.
