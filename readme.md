@@ -1,4 +1,6 @@
-# Native PostgreSQL driver for Zig
+# Native PostgreSQL driver for Zig (async fork)
+
+*This is a fork of Karl Seguin's pg.zig that uses [zio](https://github.com/lalinsky/zio) for networking and concurrency. That allows it to be used in coroutines, using asynchronous I/O operations.*
 
 A native PostgresSQL driver / client for Zig. Supports [LISTEN](#listen--notify).
 
