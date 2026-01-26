@@ -1,6 +1,7 @@
 const std = @import("std");
 const lib = @import("lib.zig");
 const builtin = @import("builtin");
+const zio = @import("zio");
 
 const posix = std.posix;
 const Conn = lib.Conn;
@@ -71,14 +72,10 @@ fn ReaderT(comptime T: type) type {
         // as well.
         pub fn startFlow(self: *Self, allocator: ?Allocator, timeout_ms: ?u32) !void {
             if (timeout_ms) |ms| {
-                const timeval = std.mem.toBytes(posix.timeval{
-                    .sec = @intCast(@divTrunc(ms, 1000)),
-                    .usec = @intCast(@mod(ms, 1000) * 1000),
-                });
-                try posix.setsockopt(self.stream.socket, posix.SOL.SOCKET, posix.SO.RCVTIMEO, &timeval);
+                self.stream.setTimeout(.{ .duration = .fromMilliseconds(ms) });
                 self.has_timeout = true;
-            } else if (self.has_timeout) {
-                try posix.setsockopt(self.stream.socket, posix.SOL.SOCKET, posix.SO.RCVTIMEO, &zero_timeval);
+            } else {
+                self.stream.setTimeout(.none);
                 self.has_timeout = false;
             }
 

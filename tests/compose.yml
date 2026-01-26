@@ -10,11 +10,12 @@ services:
     ports:
       - 5432:5432
     volumes:
-      - "./root.crt:/etc/postgresql/root.crt:ro"
-      - "./server.crt:/etc/postgresql/server.crt:ro"
-      - "./server.key:/etc/postgresql/server.key:ro"
+      - "./root.crt:/tmp/certs/root.crt:ro"
+      - "./server.crt:/tmp/certs/server.crt:ro"
+      - "./server.key:/tmp/certs/server.key:ro"
       - "./pg_hba.conf:/etc/postgresql/pg_hba.conf:ro"
       - "./postgresql.conf:/etc/postgresql/postgresql.conf:ro"
+      - "./00_fix_certs.sh:/docker-entrypoint-initdb.d/00_fix_certs.sh:ro"
       - "./init_ssl.sql:/docker-entrypoint-initdb.d/init_ssl.sql:ro"
     command:
       - "postgres"

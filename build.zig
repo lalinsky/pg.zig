@@ -15,6 +15,7 @@ pub fn build(b: *std.Build) !void {
         .imports = &.{
             .{ .name = "buffer", .module = b.dependency("buffer", dep_opts).module("buffer") },
             .{ .name = "metrics", .module = b.dependency("metrics", dep_opts).module("metrics") },
+            .{ .name = "zio", .module = b.dependency("zio", dep_opts).module("zio") },
         },
     });
 
@@ -65,6 +66,7 @@ pub fn build(b: *std.Build) !void {
                 .imports = &.{
                     .{ .name = "buffer", .module = b.dependency("buffer", dep_opts).module("buffer") },
                     .{ .name = "metrics", .module = b.dependency("metrics", dep_opts).module("metrics") },
+                    .{ .name = "zio", .module = b.dependency("zio", dep_opts).module("zio") },
                 },
             }),
             .test_runner = .{ .path = b.path("test_runner.zig"), .mode = .simple },
@@ -78,7 +80,7 @@ pub fn build(b: *std.Build) !void {
 
         {
             const options = b.addOptions();
-            options.addOption(bool, "openssl", true);
+            options.addOption(bool, "openssl", false);
             options.addOption(bool, "column_names", false);
             lib_test.root_module.addOptions("config", options);
         }

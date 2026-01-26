@@ -28,9 +28,16 @@ pub fn writeMetrics(writer: anytype) !void {
 }
 
 const t = lib.testing;
-test {
+test "tests:beforeAll" {
     try t.setup();
+}
+
+test {
     std.testing.refAllDecls(@This());
+}
+
+test "tests:afterAll" {
+    try t.teardown();
 }
 
 test "pg: uuidToHex" {

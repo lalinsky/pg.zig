@@ -1,4 +1,5 @@
 const std = @import("std");
+const zio = @import("zio");
 
 const Allocator = std.mem.Allocator;
 const Conn = @import("conn.zig").Conn;
@@ -6,6 +7,8 @@ const Conn = @import("conn.zig").Conn;
 pub const allocator = std.testing.allocator;
 
 pub var arena = std.heap.ArenaAllocator.init(allocator);
+pub var runtime: *zio.Runtime = undefined;
+pub var runtime_initialized = false;
 
 pub fn reset() void {
     _ = arena.reset(.free_all);
@@ -44,6 +47,10 @@ pub fn getRandom() std.Random.DefaultPrng {
 }
 
 pub fn setup() !void {
+    if (!runtime_initialized) {
+        runtime = try zio.Runtime.init(std.heap.smp_allocator, .{});
+        runtime_initialized = true;
+    }
     var c = connect(.{});
     defer c.deinit();
     _ = c.exec(
@@ -117,6 +124,13 @@ pub fn setup() !void {
     , .{}) catch |err| try fail(c, err);
 }
 
+pub fn teardown() !void {
+    if (runtime_initialized) {
+        runtime.deinit();
+        runtime_initialized = false;
+    }
+}
+
 // Dummy net.Stream, lets us setup data to be read and capture data that is written.
 pub const Stream = struct {
     closed: bool,
@@ -154,6 +168,11 @@ pub const Stream = struct {
 
     pub fn add(self: *Stream, value: []const u8) void {
         self._to_read.appendSlice(allocator, value) catch unreachable;
+    }
+
+    pub fn setTimeout(self: *Stream, timeout: zio.time.Timeout) void {
+        _ = self;
+        _ = timeout;
     }
 
     pub fn read(self: *Stream, buf: []u8) !usize {
@@ -199,7 +218,7 @@ pub const Stream = struct {
 pub fn connect(opts: anytype) Conn {
     const T = @TypeOf(opts);
 
-    var c = Conn.open(allocator, .{
+    var c = Conn.open(allocator, runtime, .{
         .tls = if (@hasField(T, "tls")) opts.tls else .off,
         .host = if (@hasField(T, "host")) opts.host else "localhost",
         .read_buffer = if (@hasField(T, "read_buffer")) opts.read_buffer else 2000,

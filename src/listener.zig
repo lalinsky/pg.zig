@@ -1,6 +1,7 @@
 const std = @import("std");
 const lib = @import("lib.zig");
 const Buffer = @import("buffer").Buffer;
+const zio = @import("zio");
 
 const proto = lib.proto;
 const Conn = lib.Conn;
@@ -32,9 +33,10 @@ pub const Listener = struct {
     _err_data: ?[]const u8 = null,
 
     _allocator: Allocator,
+    _rt: *zio.Runtime,
 
-    pub fn open(allocator: Allocator, opts: Conn.Opts) !Listener {
-        var stream = try Stream.connect(allocator, opts, null);
+    pub fn open(allocator: Allocator, rt: *zio.Runtime, opts: Conn.Opts) !Listener {
+        var stream = try Stream.connect(allocator, rt, opts, null);
         errdefer stream.close();
 
         const buf = try Buffer.init(allocator, opts.write_buffer orelse 2048);
@@ -44,6 +46,7 @@ pub const Listener = struct {
         errdefer reader.deinit();
 
         return .{
+            ._rt = rt,
             ._buf = buf,
             ._stream = stream,
             ._reader = reader,
@@ -88,7 +91,7 @@ pub const Listener = struct {
     }
 
     const ListenOpts = struct {
-        timeout: u32 = 0,
+        timeout: ?u32 = null,
     };
     pub fn listen(self: *Listener, channel: []const u8, opts: ListenOpts) !void {
         // LISTEN doesn't support parameterized queries. It has to be a simple query.
@@ -203,14 +206,14 @@ pub const Listener = struct {
 
 const t = lib.testing;
 test "Listener" {
-    var l = try Listener.open(t.allocator, .{ .host = "localhost" });
+    var l = try Listener.open(t.allocator, t.runtime, .{ .host = "localhost" });
     defer l.deinit();
     try l.auth(t.authOpts(.{}));
     try testListener(&l);
 }
 
 test "Listener: from Pool" {
-    var pool = try lib.Pool.init(t.allocator, .{
+    var pool = try lib.Pool.init(t.allocator, t.runtime, .{
         .size = 1,
         .auth = t.authOpts(.{}),
     });
@@ -223,19 +226,23 @@ test "Listener: from Pool" {
 }
 
 fn testListener(l: *Listener) !void {
-    var reset: std.Thread.ResetEvent = .{};
-    var tt = try std.Thread.spawn(.{}, struct {
-        fn shutdown(ll: *Listener, r: *std.Thread.ResetEvent) void {
-            r.wait();
+    var reset = zio.ResetEvent.init;
+
+    var group = zio.Group.init;
+    defer group.cancel(t.runtime);
+
+    try group.spawn(t.runtime, struct {
+        fn shutdown(ll: *Listener, r: *zio.ResetEvent) !void {
+            try r.wait(t.runtime);
             ll.stop();
         }
     }.shutdown, .{ l, &reset });
-    tt.detach();
 
     try l.listen("chan-1", .{});
     try l.listen("chan_2", .{});
 
-    const thrd = try std.Thread.spawn(.{}, testNotifier, .{});
+    try group.spawn(t.runtime, testNotifier, .{});
+
     {
         const notification = l.next().?;
         try t.expectString("chan-1", notification.channel);
@@ -256,7 +263,7 @@ fn testListener(l: *Listener) !void {
 
     reset.set();
     try t.expectEqual(null, l.next());
-    thrd.join();
+    try group.wait(t.runtime);
 }
 
 fn testNotifier() void {
