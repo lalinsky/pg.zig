@@ -16,9 +16,9 @@
             .url = "git+https://github.com/lalinsky/xsync.zig?ref=v1.0.1#f552fb09958bb27e0c3dee47de9635624ab18020",
             .hash = "xsync-1.0.1-CcXcL0vEAQCPhwwG8ZL4jPDHOKz5YL9sNlRzrMJ3pL57",
         },
-        .translate_c = .{
-            .url = "git+https://codeberg.org/ziglang/translate-c?ref=2.0.1#4f5ad374e50d1a98d3da79fa5d3bda9949103bf7",
-            .hash = "translate_c-2.0.1-Q_BUWmpOBwCIhy--up1q6cl3OlIQE86iJU8R-bZ01aPj",
+        .tls = .{
+            .url = "git+https://github.com/ianic/tls.zig?ref=zig-0.16.x#e04ae448ce7ee70c136d4d48b059314543203809",
+            .hash = "tls-0.1.0-ER2e0jGpBgCkVC-Yp12NgSdHNUtZr52MleJ8roHlUa54",
         },
     },
 }
