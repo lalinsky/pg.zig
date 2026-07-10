@@ -14,6 +14,9 @@ const DEFAULT_HOST = "127.0.0.1";
 
 pub const Stream = if (lib.has_openssl) TLSStream else PlainStream;
 
+// TLS runs over memory BIOs: OpenSSL never touches the socket. All network
+// I/O goes through the Io interface (readStream/writeStream), so waiting
+// suspends the coroutine instead of blocking the event-loop thread.
 const TLSStream = struct {
     valid: bool,
     ssl: ?*openssl.SSL,
@@ -39,6 +42,14 @@ const TLSStream = struct {
             ssl = openssl.SSL_new(ctx) orelse return error.SSLNewFailed;
             errdefer openssl.SSL_free(ssl);
 
+            const rbio = openssl.BIO_new(openssl.BIO_s_mem()) orelse return error.SSLNewFailed;
+            const wbio = openssl.BIO_new(openssl.BIO_s_mem()) orelse {
+                _ = openssl.BIO_free(rbio);
+                return error.SSLNewFailed;
+            };
+            // ownership of both BIOs transfers to ssl; SSL_free frees them
+            openssl.SSL_set_bio(ssl, rbio, wbio);
+
             if (opts.host) |host| {
                 if (isHostName(host)) {
                     // don't send this for an ip address
@@ -55,6 +66,15 @@ const TLSStream = struct {
                     if (openssl.SSL_set_tlsext_host_name(ssl, h.ptr) != 1) {
                         return error.SSLHostNameFailed;
                     }
+
+                    switch (opts.tls) {
+                        // SNI alone doesn't bind the certificate to the hostname;
+                        // without this, any CA-valid cert passes verify_full.
+                        .verify_full => if (openssl.SSL_set1_host(ssl, h.ptr) != 1) {
+                            return error.SSLHostNameFailed;
+                        },
+                        else => {},
+                    }
                 }
                 switch (opts.tls) {
                     .verify_full => openssl.SSL_set_verify(ssl, openssl.SSL_VERIFY_PEER, null),
@@ -62,24 +82,28 @@ const TLSStream = struct {
                 }
             }
 
-            if (openssl.SSL_set_fd(ssl, if (@import("builtin").os.tag == .windows) @intCast(@intFromPtr(stream.socket.handle)) else stream.socket.handle) != 1) {
-                return error.SSLSetFdFailed;
-            }
-
-            {
+            while (true) {
+                openssl.ERR_clear_error();
                 const ret = openssl.SSL_connect(ssl);
-                if (ret != 1) {
-                    const verification_code = openssl.SSL_get_verify_result(ssl);
-                    if (comptime lib._stderr_tls) {
-                        lib.printSSLError();
-                    }
-                    if (verification_code != openssl.X509_V_OK) {
+                // classify before flushBio touches OpenSSL again (SSL_get_error contract)
+                const err = if (ret == 1) 0 else openssl.SSL_get_error(ssl, ret);
+                flushBio(wbio, stream, io) catch return error.SSLConnectFailed;
+                if (ret == 1) break;
+                switch (err) {
+                    openssl.SSL_ERROR_WANT_READ => fillBio(rbio, stream, io) catch return error.SSLConnectFailed,
+                    else => {
+                        const verification_code = openssl.SSL_get_verify_result(ssl);
                         if (comptime lib._stderr_tls) {
-                            std.debug.print("ssl verification error: {s}\n", .{openssl.X509_verify_cert_error_string(verification_code)});
+                            lib.printSSLError();
                         }
-                        return error.SSLCertificationVerificationError;
-                    }
-                    return error.SSLConnectFailed;
+                        if (verification_code != openssl.X509_V_OK) {
+                            if (comptime lib._stderr_tls) {
+                                std.debug.print("ssl verification error: {s}\n", .{openssl.X509_verify_cert_error_string(verification_code)});
+                            }
+                            return error.SSLCertificationVerificationError;
+                        }
+                        return error.SSLConnectFailed;
+                    },
                 }
             }
         }
@@ -96,6 +120,7 @@ const TLSStream = struct {
         if (self.ssl) |ssl| {
             if (self.valid) {
                 _ = openssl.SSL_shutdown(ssl);
+                flushBio(openssl.SSL_get_wbio(ssl).?, self.stream, self.io) catch {}; // best-effort close_notify
                 self.valid = false;
             }
             openssl.SSL_free(ssl);
@@ -109,30 +134,86 @@ const TLSStream = struct {
 
     pub fn writeAll(self: *Stream, data: []const u8) !void {
         if (self.ssl) |ssl| {
-            const result = openssl.SSL_write(ssl, data.ptr, @intCast(data.len));
-            if (result <= 0) {
+            return sslWrite(ssl, self.stream, self.io, data) catch {
                 self.valid = false;
                 return error.SSLWriteFailed;
-            }
-            return;
+            };
         }
         return writeStream(self.stream, self.io, data);
     }
 
     pub fn read(self: *Stream, buf: []u8) !usize {
         if (self.ssl) |ssl| {
-            var read_len: usize = undefined;
-            const result = openssl.SSL_read_ex(ssl, buf.ptr, @intCast(buf.len), &read_len);
-            if (result <= 0) {
+            return sslRead(ssl, self.stream, self.io, buf) catch {
                 self.valid = false;
                 return error.SSLReadFailed;
-            }
-            return read_len;
+            };
         }
 
         return readStream(self.stream, self.io, buf);
     }
 };
+
+fn sslWrite(ssl: *openssl.SSL, stream: Io.net.Stream, io: Io, data: []const u8) !void {
+    while (true) {
+        openssl.ERR_clear_error();
+        const result = openssl.SSL_write(ssl, data.ptr, @intCast(data.len));
+        // classify before flushBio touches OpenSSL again (SSL_get_error contract)
+        const err = if (result > 0) 0 else openssl.SSL_get_error(ssl, result);
+        try flushBio(openssl.SSL_get_wbio(ssl).?, stream, io);
+        if (result > 0) {
+            // no partial-write mode + unbounded memory BIO: result > 0 means all of data
+            return;
+        }
+        switch (err) {
+            // WANT_READ mid-write: TLS 1.3 key update / renegotiation
+            openssl.SSL_ERROR_WANT_READ => try fillBio(openssl.SSL_get_rbio(ssl).?, stream, io),
+            else => return error.SSLWriteFailed,
+        }
+    }
+}
+
+fn sslRead(ssl: *openssl.SSL, stream: Io.net.Stream, io: Io, buf: []u8) !usize {
+    while (true) {
+        openssl.ERR_clear_error();
+        var read_len: usize = undefined;
+        if (openssl.SSL_read_ex(ssl, buf.ptr, buf.len, &read_len) > 0) {
+            return read_len;
+        }
+        switch (openssl.SSL_get_error(ssl, 0)) {
+            openssl.SSL_ERROR_WANT_READ => {
+                // flush first: SSL may need to send (e.g. key update ack) before it can read
+                try flushBio(openssl.SSL_get_wbio(ssl).?, stream, io);
+                try fillBio(openssl.SSL_get_rbio(ssl).?, stream, io);
+            },
+            else => return error.SSLReadFailed,
+        }
+    }
+}
+
+// drain everything OpenSSL queued in the write BIO out to the socket
+fn flushBio(wbio: *openssl.BIO, stream: Io.net.Stream, io: Io) !void {
+    var buf: [4096]u8 = undefined;
+    while (true) {
+        const n = openssl.BIO_read(wbio, &buf, buf.len);
+        if (n <= 0) return; // memory BIO: <= 0 just means empty
+        try writeStream(stream, io, buf[0..@intCast(n)]);
+    }
+}
+
+// read from the socket (suspends the coroutine) and feed OpenSSL's read BIO
+fn fillBio(rbio: *openssl.BIO, stream: Io.net.Stream, io: Io) !void {
+    var buf: [4096]u8 = undefined;
+    const n = try readStream(stream, io, &buf);
+    if (n == 0) {
+        // readVec surfaces EOF as error.EndOfStream, so this shouldn't happen;
+        // guard anyway — feeding 0 bytes to the BIO would livelock the caller
+        return error.SSLReadFailed;
+    }
+    if (openssl.BIO_write(rbio, &buf, @intCast(n)) != n) {
+        return error.SSLReadFailed;
+    }
+}
 
 const PlainStream = struct {
     io: Io,
