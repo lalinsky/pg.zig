@@ -12,6 +12,10 @@
             .url = "git+https://github.com/karlseguin/metrics.zig#ac167295b6a8fd84ca7af852c1032e6b246101f0",
             .hash = "metrics-0.0.0-W7G4eGWhAQC-C6tpIW3uxJp-vl6rLyfJvoqJRLzF1SuS",
         },
+        .xsync = .{
+            .url = "git+https://github.com/lalinsky/xsync.zig?ref=v1.0.1#f552fb09958bb27e0c3dee47de9635624ab18020",
+            .hash = "xsync-1.0.1-CcXcL0vEAQCPhwwG8ZL4jPDHOKz5YL9sNlRzrMJ3pL57",
+        },
         .translate_c = .{
             .url = "git+https://codeberg.org/ziglang/translate-c?ref=2.0.1#4f5ad374e50d1a98d3da79fa5d3bda9949103bf7",
             .hash = "translate_c-2.0.1-Q_BUWmpOBwCIhy--up1q6cl3OlIQE86iJU8R-bZ01aPj",
