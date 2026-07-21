@@ -8,8 +8,8 @@ See or run [example/main.zig](https://github.com/karlseguin/pg.zig/blob/master/e
 
 It's a running fork, that I try to keep up to date with the upstream master branch. There are a few changes to make it work with green thread `std.Io` implementations.
 
-1) Use tls.zig instead of OpenSSL
-2) Use xsync.zig instead of synchronization primitives from the standard library
+1) Use tls.zig instead of OpenSSL, to allow using the provided `std.Io` implemenation
+2) Use xsync.zig instead of synchronization primitives from the standard library to avoid cancellation issues
 
 ## Zig Version
 This is for Zig 0.16.0. Use the [zig-0.15.2](https://github.com/karlseguin/pg.zig/tree/zig-0.15) branch for Zig 0.15 or the [dev](https://github.com/karlseguin/pg.zig/tree/dev) which may or may not be up to date with zig dev.
