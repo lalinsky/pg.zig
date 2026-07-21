@@ -1,5 +1,6 @@
 const std = @import("std");
 const lib = @import("lib.zig");
+const xsync = @import("xsync");
 
 const log = lib.log;
 const Conn = lib.Conn;
@@ -23,8 +24,8 @@ pub const Pool = struct {
     _available: usize,
     _missing: usize,
     _allocator: Allocator,
-    _mutex: Io.Mutex,
-    _cond: Io.Condition,
+    _mutex: xsync.Mutex,
+    _cond: xsync.Condition,
     _ssl_ctx: ?*lib.SSLCtx,
     _reconnector: Reconnector,
     // not to be used outside of init
@@ -155,9 +156,6 @@ pub const Pool = struct {
         try self._mutex.lock(io);
         errdefer self._mutex.unlock(io);
 
-        const SelectResult = union(enum) { t: Io.Cancelable!void, c: Io.Cancelable!void };
-        var select_buf: [1]SelectResult = undefined;
-
         while (true) {
             const available = self._available;
             const missing = self._missing;
@@ -180,12 +178,15 @@ pub const Pool = struct {
 
                 const remaining_ns = deadline - elapsed;
 
-                var select: Io.Select(SelectResult) = .init(io, &select_buf);
-                defer select.cancelDiscard();
-                try select.concurrent(.t, Io.sleep, .{ io, .fromNanoseconds(remaining_ns), .awake });
-                try select.concurrent(.c, Io.Condition.wait, .{ &self._cond, io, &self._mutex });
-
-                _ = try select.await();
+                self._cond.waitTimeout(io, &self._mutex, .{ .duration = .{
+                    .raw = .fromNanoseconds(remaining_ns),
+                    .clock = .awake,
+                } }) catch |err| switch (err) {
+                    // the deadline check at the top of the loop turns this into
+                    // error.Timeout, but only after re-checking for a connection
+                    error.Timeout => {},
+                    error.Canceled => |e| return e,
+                };
                 continue;
             }
 
@@ -310,7 +311,7 @@ const Reconnector = struct {
     stopped: bool,
 
     pool: *Pool,
-    mutex: Io.Mutex,
+    mutex: xsync.Mutex,
 
     // the thread, if any, that the monitor is running in
     thread: ?Thread,

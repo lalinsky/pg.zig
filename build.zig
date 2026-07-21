@@ -37,6 +37,7 @@ pub fn build(b: *std.Build) !void {
         .imports = &.{
             .{ .name = "buffer", .module = b.dependency("buffer", dep_opts).module("buffer") },
             .{ .name = "metrics", .module = b.dependency("metrics", dep_opts).module("metrics") },
+            .{ .name = "xsync", .module = b.dependency("xsync", dep_opts).module("xsync") },
             .{ .name = "openssl", .module = openssl_module },
         },
     });
@@ -81,6 +82,7 @@ pub fn build(b: *std.Build) !void {
                 .imports = &.{
                     .{ .name = "buffer", .module = b.dependency("buffer", dep_opts).module("buffer") },
                     .{ .name = "metrics", .module = b.dependency("metrics", dep_opts).module("metrics") },
+                    .{ .name = "xsync", .module = b.dependency("xsync", dep_opts).module("xsync") },
                     .{ .name = "openssl", .module = t.mod },
                 },
             }),
