@@ -15,6 +15,7 @@ pub fn build(b: *std.Build) !void {
         .imports = &.{
             .{ .name = "buffer", .module = b.dependency("buffer", dep_opts).module("buffer") },
             .{ .name = "metrics", .module = b.dependency("metrics", dep_opts).module("metrics") },
+            .{ .name = "xsync", .module = b.dependency("xsync", dep_opts).module("xsync") },
             .{ .name = "tls", .module = b.dependency("tls", dep_opts).module("tls") },
         },
     });
@@ -41,6 +42,7 @@ pub fn build(b: *std.Build) !void {
                 .imports = &.{
                     .{ .name = "buffer", .module = b.dependency("buffer", dep_opts).module("buffer") },
                     .{ .name = "metrics", .module = b.dependency("metrics", dep_opts).module("metrics") },
+                    .{ .name = "xsync", .module = b.dependency("xsync", dep_opts).module("xsync") },
                     .{ .name = "tls", .module = b.dependency("tls", dep_opts).module("tls") },
                 },
             }),
