@@ -1,5 +1,6 @@
 const std = @import("std");
 const lib = @import("lib.zig");
+const xsync = @import("xsync");
 const Buffer = @import("buffer").Buffer;
 
 const proto = lib.proto;
@@ -232,9 +233,9 @@ test "Listener: from Pool" {
 
 fn testListener(l: *Listener) !void {
     const io = t.io;
-    var reset: std.Io.Event = .unset;
+    var reset: xsync.Event = .unset;
     var tt = try std.Thread.spawn(.{}, struct {
-        fn shutdown(io_p: Io, ll: *Listener, r: *std.Io.Event) !void {
+        fn shutdown(io_p: Io, ll: *Listener, r: *xsync.Event) !void {
             try r.wait(io_p);
             try ll.stop();
         }
