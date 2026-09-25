@@ -251,8 +251,6 @@ pub const Conn = struct {
                 errdefer stmt.deinit();
 
                 try self._reader.startFlow(stmt.arena.allocator(), opts.timeout);
-                // Send a "SYNC" command
-                try self.write(&.{ 'S', 0, 0, 0, 4 });
                 stmt.buf.reset();
                 try stmt.prepareForBind(@intCast(describe.param_oids.len));
             }
@@ -1940,6 +1938,39 @@ test "Conn: application_name" {
     defer row.deinit() catch {};
 
     try t.expectString("pg_zig_test", row.get([]const u8, 0));
+}
+
+test "Conn: startup_parameters" {
+    var params = std.StringHashMap([]const u8).init(t.allocator);
+    defer params.deinit();
+    try params.put("statement_timeout", "1234ms");
+    try params.put("DateStyle", "SQL, DMY");
+
+    var conn = try Conn.open(t.io, t.allocator, .{});
+    defer conn.deinit();
+    try conn.auth(.{
+        .username = "pgz_user_clear",
+        .password = "pgz_user_clear_pw",
+        .database = "postgres",
+        .application_name = "pg_zig_test",
+        .startup_parameters = params,
+    });
+
+    {
+        var row = (try conn.rowUnsafe("show statement_timeout", .{})) orelse unreachable;
+        defer row.deinit() catch {};
+        try t.expectString("1234ms", row.get([]const u8, 0));
+    }
+    {
+        var row = (try conn.rowUnsafe("show datestyle", .{})) orelse unreachable;
+        defer row.deinit() catch {};
+        try t.expectString("SQL, DMY", row.get([]const u8, 0));
+    }
+    {
+        var row = (try conn.rowUnsafe("show application_name", .{})) orelse unreachable;
+        defer row.deinit() catch {};
+        try t.expectString("pg_zig_test", row.get([]const u8, 0));
+    }
 }
 
 test "PG: bind strictness" {
