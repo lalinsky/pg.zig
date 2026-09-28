@@ -72,6 +72,13 @@ pub const Listener = struct {
             return;
         }
 
+        // Shielded from cancellation: `closed` is already set, so a canceled
+        // shutdown would never be retried and a next() blocked in another task
+        // would never wake up. It also keeps deinit, which ignores stop's
+        // errors, from swallowing a cancellation.
+        const prev = self._io.swapCancelProtection(.blocked);
+        defer _ = self._io.swapCancelProtection(prev);
+
         lib.sendTerminate(&self._stream, self._io);
         return self._stream.shutdown(.both);
     }
@@ -235,6 +242,41 @@ test "Listener: from Pool" {
     defer l.deinit();
 
     try testListener(&l);
+}
+
+test "Listener: stop shuts down despite a pending cancellation" {
+    const io = t.io;
+    var l = try Listener.open(io, t.allocator, .{ .host = "127.0.0.1" });
+    defer l.deinit();
+    try l.auth(t.authOpts(.{}));
+
+    const S = struct {
+        fn run(ll: *Listener, stopped: *bool) !void {
+            // hold the cancellation back until stop()
+            const prev = ll._io.swapCancelProtection(.blocked);
+            std.Io.sleep(ll._io, .fromMilliseconds(200), .awake) catch unreachable;
+            _ = ll._io.swapCancelProtection(prev);
+
+            try ll.stop();
+            stopped.* = true;
+            // the cancellation is still pending, so this returns immediately
+            try std.Io.sleep(ll._io, .fromSeconds(5), .awake);
+        }
+    };
+
+    var stopped = false;
+    var future = try io.concurrent(S.run, .{ &l, &stopped });
+    try std.Io.sleep(io, .fromMilliseconds(50), .awake);
+
+    const start = std.Io.Timestamp.now(io, .awake);
+    const result = future.cancel(io);
+    const elapsed = start.durationTo(std.Io.Timestamp.now(io, .awake)).toNanoseconds();
+
+    try t.expectError(error.Canceled, result);
+    try t.expectEqual(true, stopped);
+    try t.expectEqual(true, elapsed < std.time.ns_per_s);
+    // the socket was shut down, so next() doesn't block
+    try t.expectEqual(null, l.next());
 }
 
 fn testListener(l: *Listener) !void {

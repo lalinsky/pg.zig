@@ -203,6 +203,11 @@ pub const Pool = struct {
             self._allocator.destroy(conn);
 
             conn_to_add = newConnection(self, true) catch |err1| {
+                // release can't return the error, and a cancellation is only
+                // reported once, so hand it back to the task for its next
+                // cancelation point
+                if (err1 == error.Canceled) io.recancel();
+
                 // we failed to create the connection, track it as missing and let
                 // the background reconnector try
                 self._mutex.lockUncancelable(io);
@@ -473,6 +478,44 @@ test "Pool: deinit while the reconnector is retrying" {
     const start = std.Io.Timestamp.now(io, .awake);
     pool.deinit();
     const elapsed = start.durationTo(std.Io.Timestamp.now(io, .awake)).toNanoseconds();
+    try t.expectEqual(true, elapsed < std.time.ns_per_s);
+}
+
+test "Pool: release keeps a cancellation raised while reconnecting" {
+    const io = t.io;
+
+    // listening but never accepting: the kernel completes the replacement
+    // connection's handshake, then auth blocks waiting for a reply
+    const addr: Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server = try addr.listen(io, .{});
+    defer server.deinit(io);
+
+    var pool = try Pool.init(io, t.allocator, .{
+        .size = 1,
+        .auth = t.authOpts(.{}),
+    });
+    defer pool.deinit();
+
+    const S = struct {
+        fn run(p: *Pool, port: u16) !void {
+            const conn = try p.acquire();
+            conn._state = .fail;
+            p._opts.connect.port = port;
+            // blocks in the replacement's auth until canceled
+            p.release(conn);
+            // if release swallowed the cancellation, this would run to the end
+            try std.Io.sleep(p._io, .fromSeconds(5), .awake);
+        }
+    };
+
+    var future = try io.concurrent(S.run, .{ pool, server.socket.address.ip4.port });
+    try std.Io.sleep(io, .fromMilliseconds(100), .awake);
+
+    const start = std.Io.Timestamp.now(io, .awake);
+    const result = future.cancel(io);
+    const elapsed = start.durationTo(std.Io.Timestamp.now(io, .awake)).toNanoseconds();
+
+    try t.expectError(error.Canceled, result);
     try t.expectEqual(true, elapsed < std.time.ns_per_s);
 }
 
