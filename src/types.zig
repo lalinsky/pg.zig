@@ -465,6 +465,14 @@ pub const MacAddr8 = struct {
     }
 };
 
+// buffer.zig's std.Io.Writer can only fail to grow, which it reports as
+// WriteFailed
+fn stringifyJson(value: anytype, buf: *buffer.Buffer) error{OutOfMemory}!void {
+    std.json.Stringify.value(value, .{}, &buf.interface) catch |err| switch (err) {
+        error.WriteFailed => return error.OutOfMemory,
+    };
+}
+
 pub const JSON = struct {
     pub const oid = OID.make(114);
     const encoding = &binary_encoding;
@@ -479,7 +487,7 @@ pub const JSON = struct {
     fn encode(value: anytype, buf: *buffer.Buffer, format_pos: usize) !void {
         buf.writeAt(JSON.encoding, format_pos);
         const state = try Encode.variableLengthStart(buf);
-        try std.json.Stringify.value(value, .{}, &buf.interface);
+        try stringifyJson(value, buf);
         Encode.variableLengthFill(buf, state);
     }
 };
@@ -501,7 +509,7 @@ pub const JSONB = struct {
         buf.writeAt(JSON.encoding, format_pos);
         const state = try Encode.variableLengthStart(buf);
         try buf.writeByte(1); // jsonb version
-        try std.json.Stringify.value(value, .{}, &buf.interface);
+        try stringifyJson(value, buf);
         Encode.variableLengthFill(buf, state);
     }
 
