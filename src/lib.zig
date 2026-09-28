@@ -237,3 +237,43 @@ test "URI: invalid scheme" {
 test "URI: invalid params" {
     try std.testing.expectError(error.UnsupportedConnectionParam, parseOpts(try std.Uri.parse("postgresql:///?bar=baz"), std.testing.allocator));
 }
+
+test "public API errors don't include ReadFailed or WriteFailed" {
+    // std.Io.Reader/Writer only say that the reader/writer failed. The
+    // caller doesn't own ours, so it can't ask them why; the concrete error
+    // must be returned instead.
+    const Listener = @import("listener.zig").Listener;
+    const c: *Conn = undefined;
+    const p: *Pool = undefined;
+    const r: *Result = undefined;
+    const l: *Listener = undefined;
+    const qr: *QueryRow = undefined;
+    const S = struct { a: i32 };
+    const results = .{
+        @TypeOf(Conn.open(undefined, undefined, .{})),
+        @TypeOf(c.auth(.{})),
+        @TypeOf(c.exec("", .{})),
+        @TypeOf(c.query("", .{ 1, 1.5, "a", &S{ .a = 1 } })),
+        @TypeOf(c.row("", .{1})),
+        @TypeOf(c.prepare("")),
+        @TypeOf(c.begin()),
+        @TypeOf(c.rollback()),
+        @TypeOf(r.next()),
+        @TypeOf(r.drain()),
+        @TypeOf(qr.deinit()),
+        @TypeOf(Pool.init(undefined, undefined, .{})),
+        @TypeOf(p.exec("", .{})),
+        @TypeOf(p.query("", .{})),
+        @TypeOf(Listener.open(undefined, undefined, .{})),
+        @TypeOf(l.auth(.{})),
+        @TypeOf(l.listen("", .{})),
+        @TypeOf(l.stop()),
+    };
+    @setEvalBranchQuota(100_000);
+    inline for (results) |R| {
+        inline for (@typeInfo(@typeInfo(R).error_union.error_set).error_set.?) |e| {
+            try testing.expectEqual(false, comptime std.mem.eql(u8, e.name, "ReadFailed"));
+            try testing.expectEqual(false, comptime std.mem.eql(u8, e.name, "WriteFailed"));
+        }
+    }
+}

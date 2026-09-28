@@ -19,8 +19,11 @@ pub const Stream = struct {
     io: Io,
     state: *State,
 
-    pub const ReadError = tls.Connection.ReadError || Io.net.Stream.Reader.Error;
-    pub const WriteError = tls.Connection.WriteError || Io.net.Stream.Writer.Error;
+    // tls.zig's ReadFailed/WriteFailed only say that its transport, our
+    // socket, failed; getReadError/getWriteError return the socket's error
+    // instead, so they are not part of these sets.
+    pub const ReadError = ErrorSetWithout(tls.Connection.ReadError, &.{error.ReadFailed}) || Io.net.Stream.Reader.Error;
+    pub const WriteError = ErrorSetWithout(tls.Connection.WriteError, &.{error.WriteFailed}) || Io.net.Stream.Writer.Error;
 
     const State = struct {
         allocator: Allocator,
@@ -168,7 +171,7 @@ pub const Stream = struct {
             // surface the socket's error (e.g. Canceled) like a plaintext connect
             error.ReadFailed => state.tcp_reader.err orelse error.Unexpected,
             error.WriteFailed => state.tcp_writer.err orelse error.Unexpected,
-            else => mapTlsError(err),
+            else => |e| mapTlsError(e),
         };
         t.reader = t.conn.reader(state.read_buf);
         t.writer = t.conn.writer(&.{});
@@ -218,9 +221,10 @@ pub const Stream = struct {
     pub fn getReadError(self: Stream) ReadError {
         const state = self.state;
         if (state.tls) |*t| {
-            if (t.reader.err) |err| {
-                if (err != error.ReadFailed) return err;
-            }
+            if (t.reader.err) |err| switch (err) {
+                error.ReadFailed => {},
+                else => |e| return e,
+            };
         }
         return state.tcp_reader.err orelse error.Unexpected;
     }
@@ -228,15 +232,20 @@ pub const Stream = struct {
     pub fn getWriteError(self: Stream) WriteError {
         const state = self.state;
         if (state.tls) |*t| {
-            if (t.writer.err) |err| {
-                if (err != error.WriteFailed) return err;
-            }
+            if (t.writer.err) |err| switch (err) {
+                error.WriteFailed => {},
+                else => |e| return e,
+            };
         }
         return state.tcp_writer.err orelse error.Unexpected;
     }
 };
 
-const TlsClientError = @typeInfo(@typeInfo(@TypeOf(tls.client)).@"fn".return_type.?).error_union.error_set;
+// startTls handles ReadFailed/WriteFailed itself, returning the socket's error
+const TlsClientError = ErrorSetWithout(
+    @typeInfo(@typeInfo(@TypeOf(tls.client)).@"fn".return_type.?).error_union.error_set,
+    &.{ error.ReadFailed, error.WriteFailed },
+);
 
 // Map tls.zig handshake errors onto the error surface the previous OpenSSL
 // backend exposed, so callers (and tests) see a stable set of errors.
@@ -385,6 +394,18 @@ pub fn sendTerminate(stream: *Stream, io: Io) void {
     const prev = io.swapCancelProtection(.blocked);
     defer _ = io.swapCancelProtection(prev);
     stream.writeAll(&.{ 'X', 0, 0, 0, 4 }) catch {};
+}
+
+// E without the errors in `excluded`
+fn ErrorSetWithout(comptime E: type, comptime excluded: []const anyerror) type {
+    var result = error{};
+    outer: for (@typeInfo(E).error_set.?) |e| {
+        for (excluded) |x| {
+            if (std.mem.eql(u8, e.name, @errorName(x))) continue :outer;
+        }
+        result = result || @TypeOf(@field(anyerror, e.name));
+    }
+    return result;
 }
 
 fn isHostName(host: []const u8) bool {
