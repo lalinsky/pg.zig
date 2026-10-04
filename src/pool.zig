@@ -199,14 +199,19 @@ pub const Pool = struct {
             // recover from this (e.g. maybe we just need to read until we get a
             // ReadyForQuery), but we wouldn't want to block for too long. For now,
             // we'll just replace the connection.
+            const canceled = conn._state == .canceled;
             conn.deinit();
             self._allocator.destroy(conn);
 
-            conn_to_add = newConnection(self, true) catch |err1| {
+            // A task canceled mid-exchange has already seen its error.Canceled,
+            // so nothing would interrupt an inline reconnect to a server that
+            // stopped answering: the background reconnector replaces it instead.
+            const replacement: anyerror!*Conn = if (canceled) error.Canceled else newConnection(self, true);
+            conn_to_add = replacement catch |err1| {
                 // release can't return the error, and a cancellation is only
-                // reported once, so hand it back to the task for its next
-                // cancelation point
-                if (err1 == error.Canceled) io.recancel();
+                // reported once, so hand one that the reconnect consumed back
+                // to the task for its next cancelation point
+                if (err1 == error.Canceled and !canceled) io.recancel();
 
                 // we failed to create the connection, track it as missing and let
                 // the background reconnector try
@@ -517,6 +522,41 @@ test "Pool: release keeps a cancellation raised while reconnecting" {
 
     try t.expectError(error.Canceled, result);
     try t.expectEqual(true, elapsed < std.time.ns_per_s);
+}
+
+test "Pool: a query canceled mid-read leaves its replacement to the reconnector" {
+    const io = t.io;
+
+    // listening but never accepting: an inline replacement would block in auth
+    const addr: Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server = try addr.listen(io, .{});
+    defer server.deinit(io);
+
+    var pool = try Pool.init(io, t.allocator, .{
+        .size = 1,
+        .auth = t.authOpts(.{}),
+    });
+    defer pool.deinit();
+    // the pool's connection is already open; only a replacement goes to the silent server
+    pool._opts.connect.port = server.socket.address.ip4.port;
+
+    const S = struct {
+        fn run(p: *Pool) !void {
+            _ = try p.exec("select pg_sleep(10)", .{});
+        }
+    };
+
+    var future = try io.concurrent(S.run, .{pool});
+    try std.Io.sleep(io, .fromMilliseconds(100), .awake);
+
+    // the cancel lands on the query's read; release must not then wait on the replacement
+    const start = std.Io.Timestamp.now(io, .awake);
+    const result = future.cancel(io);
+    const elapsed = start.durationTo(std.Io.Timestamp.now(io, .awake)).toNanoseconds();
+
+    try t.expectError(error.Canceled, result);
+    try t.expectEqual(true, elapsed < std.time.ns_per_s);
+    try t.expectEqual(1, pool.stats().missing);
 }
 
 test "Pool: Release" {
