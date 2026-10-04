@@ -65,6 +65,9 @@ pub const Conn = struct {
         // something bad happened
         fail,
 
+        // the task was canceled mid-exchange; the protocol is out of sync, as with `fail`
+        canceled,
+
         // we're doing a query
         query,
 
@@ -466,7 +469,7 @@ pub const Conn = struct {
         var reader = &self._reader;
         while (true) {
             const msg = reader.next() catch |err| {
-                self._state = .fail;
+                self._state = if (err == error.Canceled) .canceled else .fail;
                 return err;
             };
             switch (msg.type) {
@@ -489,7 +492,7 @@ pub const Conn = struct {
 
     pub fn write(self: *Conn, data: []const u8) !void {
         self._stream.writeAll(data) catch |err| {
-            self._state = .fail;
+            self._state = if (err == error.Canceled) .canceled else .fail;
             return err;
         };
     }
@@ -2113,7 +2116,7 @@ test "Conn: query is cancelable" {
 
     try t.expectError(error.Canceled, result);
     try t.expectEqual(true, elapsed_ms < 1500); // prompt, not blocked until pg_sleep ends
-    try t.expectEqual(Conn.State.fail, conn._state);
+    try t.expectEqual(Conn.State.canceled, conn._state);
     try t.expectError(error.ConnectionBusy, conn.exec("select 1", .{}));
 }
 
