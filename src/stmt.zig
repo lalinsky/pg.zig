@@ -48,6 +48,19 @@ pub const Stmt = struct {
     // by the server
     name: []const u8,
 
+    // When set, the unnamed statement is parsed in the same round trip as the
+    // Bind, typed by `param_oids` from a cached description, rather than having
+    // been parsed and described beforehand, and the portal is described in it
+    // too. See `Conn.QueryOpts.describe_cache`.
+    parse_sql: ?[]const u8 = null,
+
+    // The key of the description cache entry this statement was described by,
+    // if any, which the result removes if reading it fails.
+    described_sql: ?[]const u8 = null,
+
+    // Where the Bind message starts in `buf`: after the Parse, when there is one.
+    bind_start: usize = 0,
+
     pub fn init(conn: *Conn, opts: Conn.QueryOpts) !Stmt {
         const base_allocator = opts.allocator orelse conn._allocator;
         const arena = try base_allocator.create(ArenaAllocator);
@@ -82,7 +95,7 @@ pub const Stmt = struct {
             .param_oids = describe.param_oids,
             .column_count = @intCast(describe.result_state.oids.len),
             .result_state = describe.result_state,
-            .name = opts.cache_name.?,
+            .name = opts.cache_name orelse "",
         };
     }
 
@@ -249,13 +262,32 @@ pub const Stmt = struct {
         var buf = self.buf;
         buf.resetRetainingCapacity();
 
+        if (self.parse_sql) |sql| {
+            // Parse into the unnamed statement, with the parameter types we
+            // already know, so that it needs no Describe and goes out with the
+            // Bind, Execute and Sync.
+            const param_oids = self.param_oids[0..param_count];
+            const parse_payload_len = 4 + 1 + sql.len + 1 + 2 + 4 * param_oids.len;
+            var view = try buf.skip(1 + parse_payload_len);
+            view.writeByte('P');
+            view.writeIntBig(u32, @intCast(parse_payload_len));
+            view.writeByte(0); // unnamed statement
+            view.write(sql);
+            view.writeByte(0);
+            view.writeIntBig(u16, param_count);
+            for (param_oids) |oid| {
+                view.writeIntBig(i32, oid);
+            }
+        }
+        self.bind_start = buf.len();
+
         const name = self.name;
 
         // Bind command = 'B'
         // 4 byte length placeholder - 0, 0, 0, 0
         // portal name (empty string, length 0) - 0
         // prepared statement name  + null terminator
-        try buf.ensureTotalCapacity(1 + 4 + 1 + name.len + 1 + 2);
+        try buf.ensureUnusedCapacity(1 + 4 + 1 + name.len + 1 + 2);
 
         // length of buffer is guaranteed to be 128, so it's safe to use
         // writeAssumeCapacity (4 byte length placeholder, 1 byte empty portal)
@@ -284,7 +316,7 @@ pub const Stmt = struct {
         // We tell PostgreSQL the format (text or binary) of each parameter. This
         // information is at the start of the message, always starts at byte 9
         // and each value is 2 bytes.
-        const format_offset = 9 + (param_index * 2) + name.len;
+        const format_offset = self.bind_start + 9 + (param_index * 2) + name.len;
 
         try types.bindValue(@TypeOf(value), self.param_oids[param_index], value, self.buf, format_offset);
         self.param_index = param_index + 1;
@@ -303,11 +335,18 @@ pub const Stmt = struct {
         // want to receive the result columns in.
         try lib.types.resultEncoding(self.result_state.oids[0..self.column_count], buf);
 
-        // write the full payload length, which always starts at byte 1 (after
-        // the 'B' message type)
+        // write the full payload length, which always starts at byte 1 of the
+        // Bind (after the 'B' message type)
         // Reaching directly into buf.buf is bad!
         // -1 because the length doesn't include the 'B'
-        std.mem.writeInt(u32, buf.buf[1..5], @intCast(buf.len() - 1), .big);
+        const bind_start = self.bind_start;
+        std.mem.writeInt(u32, buf.buf[bind_start + 1 ..][0..4], @intCast(buf.len() - bind_start - 1), .big);
+
+        if (self.parse_sql != null) {
+            // Describe the portal: the rows are read by the description that
+            // comes back, not by the cached one, as pgx does.
+            try buf.write(&.{ 'D', 0, 0, 0, 6, 'P', 0 });
+        }
 
         try buf.write(&.{
             'E',
@@ -334,6 +373,19 @@ pub const Stmt = struct {
 
         try conn.write(buf.string());
 
+        if (self.parse_sql != null) {
+            // If the Parse fails, the server skips the rest up to the Sync, the
+            // same as when a Bind fails.
+            const msg = conn.read() catch |err| {
+                if (err == error.PG) try conn.recoverFromError();
+                return err;
+            };
+            if (msg.type != '1') {
+                // expecting a ParseComplete
+                return conn.unexpectedDBMessage();
+            }
+        }
+
         {
             const msg = conn.read() catch |err| {
                 if (err == error.PG) try conn.recoverFromError();
@@ -343,6 +395,10 @@ pub const Stmt = struct {
                 // expecting a BindComplete
                 return conn.unexpectedDBMessage();
             }
+        }
+
+        if (self.parse_sql != null) {
+            try self.readPortalDescription();
         }
 
         try conn.peekForError();
@@ -367,12 +423,54 @@ pub const Stmt = struct {
             ._conn = conn,
             ._arena = self.arena,
             ._release_conn = opts.release_conn,
+            ._described_sql = self.described_sql,
             ._oids = state.oids[0..column_count],
             ._values = state.values[0..column_count],
             .column_names = if (opts.column_names) state.names[0..column_count] else &[_][]const u8{},
             .number_of_columns = column_count,
         };
         return result;
+    }
+
+    // Reads the RowDescription (or NoData) for the portal into a fresh result
+    // state, which the rows are then read by.
+    fn readPortalDescription(self: *Stmt) !void {
+        const conn = self.conn;
+        const msg = conn.read() catch |err| {
+            if (err == error.PG) try conn.recoverFromError();
+            return err;
+        };
+        switch (msg.type) {
+            'n' => self.column_count = 0,
+            'T' => {
+                const data = msg.data;
+                const column_count = std.mem.readInt(u16, data[0..2], .big);
+                var state = conn._result_state;
+                if (column_count > state.oids.len) {
+                    lib.metrics.allocColumns(column_count);
+                    state = try Result.State.init(self.arena.allocator(), column_count);
+                }
+                const names_allocator: ?Allocator = if (self.opts.column_names) self.arena.allocator() else null;
+                try state.from(column_count, data, names_allocator);
+                self.result_state = state;
+                self.column_count = column_count;
+
+                // The formats were requested by the cached types. When a column
+                // has changed to a type read in the other format (text or
+                // binary), its values can't be read.
+                if (!Result.State.formatsMatch(column_count, data)) {
+                    while (true) {
+                        const m = conn.read() catch |err| {
+                            if (err == error.PG) try conn.recoverFromError();
+                            break;
+                        };
+                        if (m.type == 'Z') break;
+                    }
+                    return error.StatementDescriptionChanged;
+                }
+            },
+            else => return conn.unexpectedDBMessage(),
+        }
     }
 
     pub const Describe = struct {

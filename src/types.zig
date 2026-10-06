@@ -930,7 +930,7 @@ pub const CharArray = struct {
 };
 
 // Return the encoding we want PG to use for a particular OID
-fn resultEncodingFor(oid: i32) *const [2]u8 {
+pub fn resultEncodingFor(oid: i32) *const [2]u8 {
     inline for (@typeInfo(@This()).@"struct".decls) |decl| {
         const S = @field(@This(), decl.name);
         if (@typeInfo(@TypeOf(S)) == .type and @hasField(S, "oid")) {

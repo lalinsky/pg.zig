@@ -183,6 +183,8 @@ pub fn connect(opts: anytype) !Conn {
         .tls = if (@hasField(T, "tls")) opts.tls else .off,
         .host = if (@hasField(T, "host")) opts.host else "127.0.0.1",
         .read_buffer = if (@hasField(T, "read_buffer")) opts.read_buffer else 2000,
+        .describe_cache = if (@hasField(T, "describe_cache")) opts.describe_cache else false,
+        .describe_cache_size = if (@hasField(T, "describe_cache_size")) opts.describe_cache_size else 512,
     });
 
     c.auth(authOpts(opts)) catch |err| {

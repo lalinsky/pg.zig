@@ -6,6 +6,7 @@ const proto = lib.proto;
 const types = lib.types;
 const Pool = lib.Pool;
 const Stmt = lib.Stmt;
+const DescribeCache = lib.DescribeCache;
 const Reader = lib.Reader;
 const Result = lib.Result;
 const Stream = lib.Stream;
@@ -59,6 +60,10 @@ pub const Conn = struct {
     // cache_name => data necessary to re-execute previously prepared statement.
     _prepared_statements: std.hash_map.StringHashMapUnmanaged(Stmt.Describe),
 
+    // sql => its description, for queries run with `describe_cache`.
+    _described_statements: DescribeCache,
+    _describe_cache: bool,
+
     const State = enum {
         idle,
 
@@ -78,6 +83,12 @@ pub const Conn = struct {
         write_buffer: ?u16 = null,
         read_buffer: ?u16 = null,
         result_state_size: u16 = 32,
+        // The default for the `describe_cache` query option, for queries that
+        // don't set it.
+        describe_cache: bool = false,
+        // How many statement descriptions the `describe_cache` query option
+        // keeps, evicting the least recently used. 0 disables it.
+        describe_cache_size: u16 = 512,
         tls: TLS = .off,
 
         // tcp keepalive settings (null timer = OS default)
@@ -116,6 +127,18 @@ pub const Conn = struct {
         // When not null, the prepared statement will be cached and re-used
         // by subsequent queries using the same name.
         cache_name: ?[]const u8 = null,
+
+        // When true, and cache_name is null, the statement's description (its
+        // parameter and result types) is cached on the connection, keyed by the
+        // SQL, as with pgx's QueryExecModeCacheDescribe. Later executions of the
+        // same SQL then parse, bind, describe and execute the unnamed statement
+        // in a single round trip, rather than first parsing and describing it
+        // in a round trip of its own. Nothing is kept on the server, so unlike
+        // cache_name, this works through a connection pooler in transaction
+        // mode. An error from such a query removes its description, so the next
+        // execution describes it again. Null uses the connection's
+        // describe_cache option.
+        describe_cache: ?bool = null,
     };
 
     pub fn openAndAuthUri(io: Io, allocator: Allocator, uri: std.Uri) !Conn {
@@ -160,6 +183,8 @@ pub const Conn = struct {
             ._param_oids = param_oids,
             ._result_state = result_state,
             ._prepared_statements = .{},
+            ._described_statements = .init(opts.describe_cache_size),
+            ._describe_cache = opts.describe_cache,
         };
     }
 
@@ -181,6 +206,8 @@ pub const Conn = struct {
             value_ptr.arena.deinit();
         }
         self._prepared_statements.deinit(self._allocator);
+
+        self._described_statements.deinit(self._allocator);
     }
 
     pub fn release(self: *Conn) void {
@@ -230,6 +257,9 @@ pub const Conn = struct {
 
     pub fn queryOpts(self: *Conn, sql: []const u8, values: anytype, opts: QueryOpts) !*Result {
         return self.doQuery(sql, values, opts) catch |err| {
+            if (self.describeCache(opts)) {
+                self._described_statements.invalidate(self._allocator, sql);
+            }
             self.maybeRelease(opts.release_conn);
             return err;
         };
@@ -243,6 +273,7 @@ pub const Conn = struct {
         var cached = false;
         var stmt: Stmt = undefined;
         const name = opts.cache_name;
+        const describe_cache = name == null and self.describeCache(opts) and self._described_statements.capacity > 0;
 
         if (name) |n| {
             if (self._prepared_statements.getPtr(n)) |describe| {
@@ -253,6 +284,19 @@ pub const Conn = struct {
                 try self._reader.startFlow(stmt.arena.allocator(), opts.timeout);
                 stmt.buf.reset();
                 try stmt.prepareForBind(@intCast(describe.param_oids.len));
+            }
+        } else if (describe_cache) {
+            if (self._described_statements.get(sql)) |entry| {
+                cached = true;
+                stmt = try Stmt.fromDescribe(self, &entry.describe, opts);
+                errdefer stmt.deinit();
+                // Parsed again, with the rest, rather than prepared on the server.
+                stmt.parse_sql = sql;
+                stmt.described_sql = entry.sql;
+
+                try self._reader.startFlow(stmt.arena.allocator(), opts.timeout);
+                stmt.buf.reset();
+                try stmt.prepareForBind(@intCast(entry.describe.param_oids.len));
             }
         }
 
@@ -275,6 +319,23 @@ pub const Conn = struct {
                     .param_oids = stmt.param_oids,
                     .result_state = stmt.result_state,
                 });
+            } else if (describe_cache) {
+                // As pgx does, the statement is parsed again to execute it, in
+                // the same round trip, rather than bound to the one just
+                // described: a pooler may run the two round trips on different
+                // server connections.
+                stmt.parse_sql = sql;
+
+                var describe_arena = ArenaAllocator.init(self._allocator);
+                errdefer describe_arena.deinit();
+                try stmt.prepare(sql, describe_arena.allocator());
+
+                const entry = try self._described_statements.put(self._allocator, sql, .{
+                    .arena = describe_arena,
+                    .param_oids = stmt.param_oids,
+                    .result_state = stmt.result_state,
+                });
+                stmt.described_sql = entry.sql;
             } else {
                 try stmt.prepare(sql, null);
             }
@@ -342,6 +403,15 @@ pub const Conn = struct {
     }
 
     pub fn execOpts(self: *Conn, sql: []const u8, values: anytype, opts: QueryOpts) !?i64 {
+        return self.doExec(sql, values, opts) catch |err| {
+            if (self.describeCache(opts)) {
+                self._described_statements.invalidate(self._allocator, sql);
+            }
+            return err;
+        };
+    }
+
+    fn doExec(self: *Conn, sql: []const u8, values: anytype, opts: QueryOpts) !?i64 {
         if (self.canQuery() == false) {
             return error.ConnectionBusy;
         }
@@ -524,6 +594,10 @@ pub const Conn = struct {
             return true;
         }
         return false;
+    }
+
+    inline fn describeCache(self: *const Conn, opts: QueryOpts) bool {
+        return opts.describe_cache orelse self._describe_cache;
     }
 
     inline fn maybeRelease(self: *Conn, rel: bool) void {
@@ -2149,6 +2223,168 @@ test "PG: cached query" {
         try t.expectError(error.PG, c.queryOpts("slc", .{ 2, "ghanima" }, .{ .cache_name = "c1" }));
         try t.expectEqual(true, std.mem.find(u8, c.err.?.message, "syntax error at or near \"slc\"") != null);
     }
+}
+
+test "PG: describe-cached query" {
+    var c = try t.connect(.{});
+    defer c.deinit();
+
+    // The parameters' types come from the server, as without the cache: an i64
+    // binds to a timestamptz as microseconds, and a hex string to a uuid.
+    const sql = "select $1::int as id, $2::text as name, $3::timestamptz as ts, $4::uuid as u";
+    for ([_]i32{ 1, 2, 3 }) |id| {
+        var result = try c.queryOpts(sql, .{ id, "leto", 1_700_000_000_000_000, "8d9f9e6c-1f3a-4c2b-9a7e-2f4d5c6b7a81" }, .{ .describe_cache = true, .column_names = true });
+        try t.expectString("ts", result.column_names[2]);
+        const row = (try result.next()) orelse unreachable;
+        try t.expectEqual(id, try row.get(i32, 0));
+        try t.expectString("leto", try row.get([]u8, 1));
+        try t.expectEqual(1_700_000_000_000_000, try row.get(i64, 2));
+        try t.expectEqual(16, (try row.get([]u8, 3)).len);
+        try t.expectEqual(null, try result.next());
+        result.deinit();
+
+        // Replaces the unnamed statement, so the next execution only works if
+        // it parses its own.
+        try t.expectEqual(7, t.scalar(&c, "select 7"));
+    }
+    // Described once, by the SQL; nothing named on the server.
+    try t.expectEqual(1, c._described_statements.map.count());
+    try t.expectEqual(0, c._prepared_statements.count());
+
+    // exec, and statements with no result, go through it too.
+    _ = try c.exec("create temp table describe_cached_exec (v int)", .{});
+    for (0..2) |_| {
+        try t.expectEqual(1, try c.execOpts("insert into describe_cached_exec values ($1)", .{1}, .{ .describe_cache = true }));
+    }
+    try t.expectEqual(2, t.scalar(&c, "select count(*)::int from describe_cached_exec"));
+}
+
+test "PG: describe-cached query reads rows by their current description" {
+    var c = try t.connect(.{});
+    defer c.deinit();
+
+    _ = try c.exec("create temp table describe_cached_types (v int)", .{});
+    _ = try c.exec("insert into describe_cached_types values (1)", .{});
+    const sql = "select * from describe_cached_types where v = $1";
+    {
+        var row = (try c.rowOpts(sql, .{1}, .{ .describe_cache = true })).?;
+        try t.expectEqual(1, try row.get(i32, 0));
+        try row.deinit();
+    }
+
+    // Both binary, so the cached formats still hold, and the rows are read as
+    // the bigint they now are.
+    _ = try c.exec("alter table describe_cached_types alter column v type bigint", .{});
+    {
+        var row = (try c.rowOpts(sql, .{1}, .{ .describe_cache = true })).?;
+        try t.expectError(error.InvalidType, row.get(i32, 0));
+        try t.expectEqual(1, try row.get(i64, 0));
+        try row.deinit();
+    }
+
+    // A column more than were described: a single result format applies to
+    // every column, so it comes back in it, and is read too.
+    _ = try c.exec("alter table describe_cached_types add column w text", .{});
+    {
+        var row = (try c.rowOpts(sql, .{1}, .{ .describe_cache = true })).?;
+        try t.expectEqual(2, row.result.number_of_columns);
+        try t.expectEqual(1, try row.get(i64, 0));
+        try t.expectEqual(null, try row.get(?[]u8, 1));
+        try row.deinit();
+    }
+
+    // Described with no columns, the Bind asks for no formats, which means
+    // text for all of them. A column added since comes back as text, which an
+    // int isn't read as, so the query fails and the description is dropped.
+    _ = try c.exec("create temp table describe_cached_empty ()", .{});
+    _ = try c.exec("insert into describe_cached_empty default values", .{});
+    const empty_sql = "select * from describe_cached_empty where $1::int = 1";
+    {
+        var row = (try c.rowOpts(empty_sql, .{1}, .{ .describe_cache = true })).?;
+        try t.expectEqual(0, row.result.number_of_columns);
+        try row.deinit();
+    }
+    _ = try c.exec("alter table describe_cached_empty add column v int default 3", .{});
+    try t.expectError(error.StatementDescriptionChanged, c.rowOpts(empty_sql, .{1}, .{ .describe_cache = true }));
+    try t.expectEqual(true, c._described_statements.map.get(empty_sql) == null);
+    {
+        var row = (try c.rowOpts(empty_sql, .{1}, .{ .describe_cache = true })).?;
+        try t.expectEqual(3, try row.get(i32, 0));
+        try row.deinit();
+    }
+    try t.expectEqual(1, t.scalar(&c, "select 1"));
+}
+
+test "PG: describe-cached query forgets the description on an error" {
+    var c = try t.connect(.{});
+    defer c.deinit();
+
+    // A Parse that fails on a cached description leaves the connection usable.
+    _ = try c.exec("create temp table describe_cached (v int)", .{});
+    {
+        var result = try c.queryOpts("select v from describe_cached where v = $1", .{1}, .{ .describe_cache = true });
+        try t.expectEqual(null, try result.next());
+        result.deinit();
+    }
+    _ = try c.exec("drop table describe_cached", .{});
+    try t.expectError(error.PG, c.queryOpts("select v from describe_cached where v = $1", .{1}, .{ .describe_cache = true }));
+    try t.expectEqual(true, std.mem.find(u8, c.err.?.message, "does not exist") != null);
+    try t.expectEqual(0, c._described_statements.map.count());
+    try t.expectEqual(1, t.scalar(&c, "select 1"));
+
+    // So does an error while reading the rows, as in pgx.
+    const sql = "select 10 / v from unnest(array[1, $1::int]) v";
+    {
+        var result = try c.queryOpts(sql, .{2}, .{ .describe_cache = true });
+        try t.expectEqual(10, try (try result.next()).?.get(i32, 0));
+        try t.expectEqual(5, try (try result.next()).?.get(i32, 0));
+        try t.expectEqual(null, try result.next());
+        result.deinit();
+    }
+    try t.expectEqual(1, c._described_statements.map.count());
+    {
+        var result = try c.queryOpts(sql, .{0}, .{ .describe_cache = true });
+        try t.expectEqual(10, try (try result.next()).?.get(i32, 0));
+        try t.expectError(error.PG, result.next());
+        result.deinit();
+    }
+    try t.expectEqual(0, c._described_statements.map.count());
+}
+
+test "PG: describe-cached query keeps describe_cache_size descriptions" {
+    var c = try t.connect(.{ .describe_cache_size = 2 });
+    defer c.deinit();
+
+    for ([_][]const u8{ "select $1::int + 1", "select $1::int + 2", "select $1::int + 3" }) |sql| {
+        var row = (try c.rowOpts(sql, .{1}, .{ .describe_cache = true })).?;
+        try row.deinit();
+    }
+    try t.expectEqual(2, c._described_statements.map.count());
+    try t.expectEqual(true, c._described_statements.map.get("select $1::int + 1") == null);
+
+    var disabled = try t.connect(.{ .describe_cache_size = 0 });
+    defer disabled.deinit();
+    var row = (try disabled.rowOpts("select $1::int", .{1}, .{ .describe_cache = true })).?;
+    try t.expectEqual(1, try row.get(i32, 0));
+    try row.deinit();
+    try t.expectEqual(0, disabled._described_statements.map.count());
+}
+
+test "PG: describe-cached query by default" {
+    var c = try t.connect(.{ .describe_cache = true });
+    defer c.deinit();
+
+    for (0..2) |_| {
+        var row = (try c.row("select $1::int + 1", .{1})).?;
+        try t.expectEqual(2, try row.get(i32, 0));
+        try row.deinit();
+    }
+    try t.expectEqual(1, c._described_statements.map.count());
+
+    // A query can still opt out.
+    var row = (try c.rowOpts("select $1::int + 2", .{1}, .{ .describe_cache = false })).?;
+    try row.deinit();
+    try t.expectEqual(1, c._described_statements.map.count());
 }
 
 test "PG: cached query with column names" {

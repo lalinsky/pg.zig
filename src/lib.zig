@@ -10,6 +10,7 @@ pub const proto = @import("proto.zig");
 pub const auth = @import("auth.zig");
 pub const Conn = @import("conn.zig").Conn;
 pub const Stmt = @import("stmt.zig").Stmt;
+pub const DescribeCache = @import("describe_cache.zig").DescribeCache;
 pub const Pool = @import("pool.zig").Pool;
 pub const Stream = @import("stream.zig").Stream;
 pub const sendTerminate = @import("stream.zig").sendTerminate;
@@ -140,6 +141,8 @@ pub fn parseOpts(uri: std.Uri, allocator: std.mem.Allocator) !ParsedOpts {
 
     var tls: Conn.Opts.TLS = .off;
     var tcp_user_timeout: ?u32 = null;
+    var describe_cache: bool = false;
+    var describe_cache_size: u16 = 512;
     if (uri.query) |qry| {
         const query_string = try qry.toRawMaybeAlloc(aa);
         var it = std.mem.splitScalar(u8, query_string, '&');
@@ -149,6 +152,14 @@ pub fn parseOpts(uri: std.Uri, allocator: std.mem.Allocator) !ParsedOpts {
             const val = it2.rest();
             if (std.mem.eql(u8, key, "tcp_user_timeout")) {
                 tcp_user_timeout = try std.fmt.parseInt(u32, val, 10);
+            } else if (std.mem.eql(u8, key, "describe_cache")) {
+                if (std.mem.eql(u8, val, "true")) {
+                    describe_cache = true;
+                } else if (std.mem.eql(u8, val, "false") == false) {
+                    return error.InvalidDescribeCacheValue;
+                }
+            } else if (std.mem.eql(u8, key, "describe_cache_size")) {
+                describe_cache_size = try std.fmt.parseInt(u16, val, 10);
             } else if (std.mem.eql(u8, key, "sslmode")) {
                 if (std.mem.eql(u8, val, "require")) {
                     tls = .require;
@@ -181,6 +192,8 @@ pub fn parseOpts(uri: std.Uri, allocator: std.mem.Allocator) !ParsedOpts {
             .tls = tls,
             .port = uri.port orelse null,
             .host = host,
+            .describe_cache = describe_cache,
+            .describe_cache_size = describe_cache_size,
         },
     } };
 }
@@ -205,7 +218,7 @@ pub const TypeError = error{
     UnknownColumnName,
 };
 
-const valid_tcs: [2]TestCase = .{
+const valid_tcs: [3]TestCase = .{
     .{ .uri = "postgresql:///", .expected_opts = .{ .size = 0, .auth = .{ .username = "postgres" }, .connect = .{}, .timeout = 0 } },
     .{ .uri = "postgresql://user:pass@somehost:1234/somedb?tcp_user_timeout=5678", .expected_opts = .{ .size = 0, .auth = .{
         .username = "user",
@@ -215,6 +228,10 @@ const valid_tcs: [2]TestCase = .{
     }, .connect = .{
         .host = "somehost",
         .port = 1234,
+    }, .timeout = 0 } },
+    .{ .uri = "postgresql:///?describe_cache=true&describe_cache_size=64", .expected_opts = .{ .size = 0, .auth = .{ .username = "postgres" }, .connect = .{
+        .describe_cache = true,
+        .describe_cache_size = 64,
     }, .timeout = 0 } },
 };
 
@@ -236,6 +253,7 @@ test "URI: invalid scheme" {
 
 test "URI: invalid params" {
     try std.testing.expectError(error.UnsupportedConnectionParam, parseOpts(try std.Uri.parse("postgresql:///?bar=baz"), std.testing.allocator));
+    try std.testing.expectError(error.InvalidDescribeCacheValue, parseOpts(try std.Uri.parse("postgresql:///?describe_cache=yes"), std.testing.allocator));
 }
 
 test "public API errors don't include ReadFailed or WriteFailed" {

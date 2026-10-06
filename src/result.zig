@@ -28,6 +28,12 @@ pub const Result = struct {
     // Used when the result came directly from the pool.query() helper.
     _release_conn: bool,
 
+    // The description cache entry the query was described by, if any, which
+    // deinit removes if reading the result failed, so that the next execution
+    // describes it again.
+    _described_sql: ?[]const u8 = null,
+    _failed: bool = false,
+
     pub fn deinit(self: *const Result) void {
         // value.data references the buffer of the reader, this buffer is potentially
         // reused and potentially discarded. There are at least a few very good
@@ -37,6 +43,12 @@ pub const Result = struct {
         }
 
         self._conn._reader.endFlow();
+
+        if (self._failed) {
+            if (self._described_sql) |sql| {
+                self._conn._described_statements.invalidate(self._conn._allocator, sql);
+            }
+        }
 
         if (self._release_conn) {
             self._conn.release();
@@ -54,6 +66,13 @@ pub const Result = struct {
     // I don't want to do this implictly in deinit because it can fail
     // and returning an error union in deinit is a pain for the caller.
     pub fn drain(self: *Result) !void {
+        return self._drain() catch |err| {
+            self._failed = true;
+            return err;
+        };
+    }
+
+    fn _drain(self: *Result) !void {
         var conn = self._conn;
         // Only an in-flight query has anything to drain; reading in any other
         // state (e.g. a poisoned connection) would block.
@@ -73,10 +92,16 @@ pub const Result = struct {
     }
 
     pub fn next(self: *Result) !?Row {
-        return self._next(.safe);
+        return self._next(.safe) catch |err| {
+            self._failed = true;
+            return err;
+        };
     }
     pub fn nextUnsafe(self: *Result) !?RowUnsafe {
-        return self._next(.unsafe);
+        return self._next(.unsafe) catch |err| {
+            self._failed = true;
+            return err;
+        };
     }
 
     fn _next(self: *Result, comptime fail_mode: lib.FailMode) !(if (fail_mode == .safe) ?Row else ?RowUnsafe) {
@@ -236,6 +261,28 @@ pub const Result = struct {
                 // skip date type size (2), type modifier (4) format code (2)
                 pos += 8;
             }
+        }
+
+        // Whether each column of the RowDescription payload is in the format
+        // (text or binary) its type is read in.
+        pub fn formatsMatch(number_of_columns: u16, data: []const u8) bool {
+            var pos: usize = 2;
+            for (0..number_of_columns) |_| {
+                const end_pos = std.mem.indexOfScalarPos(u8, data, pos, 0) orelse return false;
+                if (data.len < (end_pos + 19)) {
+                    return false;
+                }
+                // name null terminator (1), table object_id (4), attribute number (2)
+                pos = end_pos + 7;
+                const oid = std.mem.readInt(i32, data[pos..][0..4], .big);
+                // oid (4), data type size (2), type modifier (4)
+                pos += 10;
+                if (!std.mem.eql(u8, data[pos..][0..2], types.resultEncodingFor(oid))) {
+                    return false;
+                }
+                pos += 2;
+            }
+            return true;
         }
 
         pub fn deinit(self: State, allocator: Allocator) void {

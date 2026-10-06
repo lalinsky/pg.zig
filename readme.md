@@ -119,6 +119,8 @@ Opens a connection, or returns an error. Prefer creating connections through the
 * `write_buffer` - Size of the write buffer, used when sending messages to the server. Will temporarily allocate more space as needed. If you're writing large SQL or have large parameters (e.g. long text values), making this larger might improve performance a little. Defaults to `2048`, cannot be less than `128`.
 * `read_buffer` - Size of the read buffer, used when reading data from the server. Messages larger than this are temporarily allocated as needed. Given most apps are going to be reading rows of data, this can have large impact on performance. Defaults to `4096`, cannot be less than `128`.
 * `result_state_size` - Each `Result` (retrieved via a call to `query`) carries metadata about the data (e.g. the type of each column). For results with less than or equal to `result_state_size` columns, a static `state` container is used. Queries with more columns require a dynamic allocation. Defaults to `32`. 
+* `describe_cache` - The default for the `describe_cache` query option. Defaults to `false`. See [Caching Statement Descriptions](#caching-statement-descriptions).
+* `describe_cache_size` - The number of statement descriptions kept for queries using the `describe_cache` option, evicting the least recently used. `0` disables the cache. Defaults to `512`.
 * `keepalive` - Enables `SO_KEEPALIVE` on the socket. This is recommended (and on by default) so that idle pooled connections silently dropped by a NAT/conntrack/load-balancer are detected by the kernel rather than only surfacing on the next query. Ignored for unix-socket connections. Defaults to `true`.
 * `keepalive_idle` - Seconds a connection must be idle before the first keepalive probe is sent (`TCP_KEEPIDLE`/`TCP_KEEPALIVE`). Set to `null` to leave it at the OS default. Defaults to `30`.
 * `keepalive_interval` - Seconds between keepalive probes (`TCP_KEEPINTVL`). Set to `null` to leave it at the OS default. Defaults to `10`.
@@ -153,6 +155,8 @@ Same as `query` but takes options:
 - `column_names: bool` - Whether or not the `result.column_names` should be populated. When true, this requires memory allocation (duping the column names). Defaults to `false` unless the `column_names` build option was set to true.
 - `allocator` - The allocator to use for any allocations needed when executing the query and reading the results. When `null` this will default to the connection's allocator. If you were executing a query in a web-request and each web-request had its own arena tied to the lifetime of the request, it might make sense to use that arena. Defaults to `null`.
 - `release_conn: bool` - Whether or not to call `conn.release()` when `result.deinit()` is called. Useful for writing a function that acquires a connection from a `Pool` and returns a `Result`. When `query` or `row` are called from a `Pool` this is forced to `true`. Otherwise, defaults to `false`. 
+- `cache_name: ?[]const u8` - See [Caching Prepared Statements](#caching-prepared-statements). Defaults to `null`.
+- `describe_cache: ?bool` - See [Caching Statement Descriptions](#caching-statement-descriptions). Defaults to `null`, which uses the connection's `describe_cache` option.
 
 ### row(sql: []const u8, args: anytype) !?QueryRow
 Executes the query with arguments, returns a single row. Returns an error if the query returns more than one row. Returns `null` if the query returns no row. `deinit` must be called on the returned `QueryRow`.
@@ -402,6 +406,33 @@ const result = try conn.queryOpts(
 And it **will** work. But you're playing with fire, and you should just include the same SQL and the same cache name for each execution. If you want to use the `.column_names = true` option, then it _must_ be included in the first query which generated the cache entry (again, in short, just _always_ use the same SQL and the same options).
 
 You can call `try conn.deallocate("super")` to remove a cache entry. But this is only done for the connection on which it is called. This would make sense, for example, if you get a connection from the pool, execute the same query multiple times, deallocate the cached entry, and return the connection back to the pool. Note that the name to deallocate, `super`, is not sanitized and is open to SQL injection - don't pass a user-supplied value to `deallocte`.
+
+## Caching Statement Descriptions
+Without caching, a statement with parameters takes two round trips: one to parse and describe it, and one to bind and execute it. The `describe_cache` option caches only the description (the parameter and result types), keyed by the SQL, on the connection. Once a statement is described, executing it again takes a single round trip: the unnamed statement is parsed, with the parameter types from the description, and bound, described and executed together. This is the same approach as pgx's `QueryExecModeCacheDescribe`.
+
+```zig
+const result = try conn.queryOpts(
+    "select * from saiyans where power > $1",
+    .{9000},
+    .{.describe_cache = true}
+);
+```
+
+To use it for every query on a connection, or on every connection of a pool, set the `describe_cache` connection option (`.connect = .{ .describe_cache = true }` for a pool), or the `describe_cache=true` parameter of a URI passed to `initUri` (along with `describe_cache_size=N`, if needed). A query can still opt out with `.describe_cache = false`.
+
+Unlike `cache_name`, nothing is kept on the server, and the SQL is sent with each execution. The trade-off is that PostgreSQL parses and plans the statement on every execution, as it does for an uncached one.
+
+The cache is per connection, and holds `describe_cache_size` descriptions (`512` by default), evicting the least recently used.
+
+### Schema changes
+Values are bound with the parameter types from the cached description, and rows are read with the description that comes back with each execution. If the schema or the `search_path` changes so that a cached description no longer holds, for example when a parameter's type changes, an execution of that query can fail, once per connection. Any error from a query removes its description from the cache, so the next execution describes it again. Other drivers' statement caches behave the same way (e.g. pgx's, and psycopg's prepared statements).
+
+## Connection Poolers
+With a pooler in transaction mode, such as PgBouncer with `pool_mode = transaction`, consecutive round trips of a connection can go to different server connections:
+
+* Uncached queries (the default) don't work: the statement is bound in a second round trip to the unnamed statement parsed in the first, which the server connection it lands on doesn't have, or has from another client.
+* `describe_cache` works: the round trip that executes a statement parses it again itself.
+* `cache_name` works with PgBouncer 1.21 or newer and `max_prepared_statements` set above 0, which tracks named prepared statements and prepares them on whichever server connection a client gets. `conn.deallocate` doesn't, as PgBouncer doesn't track the SQL-level `DEALLOCATE` it sends.
 
 ## Important Notice 1 - Bind vs Read
 When you read a value, e.g. using `row.get`, the library is strict and won't help you with type conversion. If you're column is a smallint, you have to `get`
