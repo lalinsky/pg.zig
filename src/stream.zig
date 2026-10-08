@@ -399,11 +399,11 @@ pub fn sendTerminate(stream: *Stream, io: Io) void {
 // E without the errors in `excluded`
 fn ErrorSetWithout(comptime E: type, comptime excluded: []const anyerror) type {
     var result = error{};
-    outer: for (@typeInfo(E).error_set.?) |e| {
+    outer: for (@typeInfo(E).error_set.error_names.?) |name| {
         for (excluded) |x| {
-            if (std.mem.eql(u8, e.name, @errorName(x))) continue :outer;
+            if (std.mem.eql(u8, name, @errorName(x))) continue :outer;
         }
-        result = result || @TypeOf(@field(anyerror, e.name));
+        result = result || @TypeOf(@field(anyerror, name));
     }
     return result;
 }

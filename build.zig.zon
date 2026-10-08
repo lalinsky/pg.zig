@@ -9,12 +9,12 @@
             .hash = "N-V-__8AAEGLAACZXqfn1yrAh1MKBAy7tUw-fQIEFU9bopsi",
         },
         .metrics = .{
-            .url = "git+https://github.com/karlseguin/metrics.zig#6de29b83a750a06c438d268543e0e3c3c1b309da",
-            .hash = "metrics-0.0.0-W7G4eIegAQD4XxA9Co7Atbw59u_2zvxYf406AZuoAHPM",
+            .url = "git+https://github.com/karlseguin/metrics.zig#ac167295b6a8fd84ca7af852c1032e6b246101f0",
+            .hash = "metrics-0.0.0-W7G4eGWhAQC-C6tpIW3uxJp-vl6rLyfJvoqJRLzF1SuS",
         },
         .xsync = .{
-            .url = "git+https://github.com/lalinsky/xsync.zig?ref=v1.0.0#2ab0801071f1918d799c115542b8121486dc2520",
-            .hash = "xsync-1.0.0-CcXcL3DCAQA0FPLdBPhtTB182kN-COorlMw_cabmgHJm",
+            .url = "git+https://github.com/nevindra/xsync.zig#506d58f6cf07e81652d0f851d8cdd3164bc7514e",
+            .hash = "xsync-1.0.0-CcXcLzDDAQBTSKpLsJcfZSY4OBYjYacatFSEAbm2WAkD",
         },
         .tls = .{
             .url = "git+https://github.com/lalinsky/tls.zig#60d0ced283fc710f25ce43ab400ce91d1f75c05a",
