@@ -946,8 +946,8 @@ pub const CharArray = struct {
 
 // Return the encoding we want PG to use for a particular OID
 fn resultEncodingFor(oid: i32) *const [2]u8 {
-    inline for (@typeInfo(@This()).@"struct".decls) |decl| {
-        const S = @field(@This(), decl.name);
+    inline for (@typeInfo(@This()).@"struct".decl_names) |decl_name| {
+        const S = @field(@This(), decl_name);
         if (@typeInfo(@TypeOf(S)) == .type and @hasField(S, "oid")) {
             if (oid == S.oid.decimal) {
                 return S.encoding;
@@ -1389,7 +1389,7 @@ pub fn bindValue(comptime T: type, oid: i32, value: anytype, buf: *buffer.Buffer
         },
         .pointer => |ptr| switch (ptr.size) {
             .slice => {
-                if (ptr.is_const) {
+                if (ptr.attrs.@"const") {
                     return bindSlice(oid, @as([]const ptr.child, value), buf, format_pos);
                 } else {
                     return bindSlice(oid, @as([]ptr.child, value), buf, format_pos);
