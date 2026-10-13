@@ -1,5 +1,6 @@
 const std = @import("std");
 const lib = @import("lib.zig");
+const xsync = @import("xsync");
 
 const log = lib.log;
 const Conn = lib.Conn;
@@ -24,8 +25,8 @@ pub const Pool = struct {
     // than _conns.len
     _open: usize,
     _allocator: Allocator,
-    _mutex: Io.Mutex,
-    _cond: Io.Condition,
+    _mutex: xsync.Mutex,
+    _cond: xsync.Condition,
     // not to be used outside of init
     _arena: ArenaAllocator,
 
