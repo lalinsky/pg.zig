@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("compat.zig");
 const builtin = @import("builtin");
 const lib = @import("lib.zig");
 const tls = @import("tls");
@@ -399,7 +400,7 @@ pub fn sendTerminate(stream: *Stream, io: Io) void {
 // E without the errors in `excluded`
 fn ErrorSetWithout(comptime E: type, comptime excluded: []const anyerror) type {
     var result = error{};
-    outer: for (@typeInfo(E).error_set.error_names.?) |name| {
+    outer: for (comptime compat.errorNames(E)) |name| {
         for (excluded) |x| {
             if (std.mem.eql(u8, name, @errorName(x))) continue :outer;
         }

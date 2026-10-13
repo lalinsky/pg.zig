@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("compat.zig");
 const lib = @import("lib.zig");
 const buffer = @import("buffer");
 
@@ -946,7 +947,7 @@ pub const CharArray = struct {
 
 // Return the encoding we want PG to use for a particular OID
 fn resultEncodingFor(oid: i32) *const [2]u8 {
-    inline for (@typeInfo(@This()).@"struct".decl_names) |decl| {
+    inline for (comptime compat.declNames(@This())) |decl| {
         const S = @field(@This(), decl);
         if (@typeInfo(@TypeOf(S)) == .type and @hasField(S, "oid")) {
             if (oid == S.oid.decimal) {

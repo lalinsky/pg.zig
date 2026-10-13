@@ -91,7 +91,11 @@ pub fn main(init: std.process.Init) !void {
 
         const ns_taken = slowest.endTiming(io, friendly_name);
 
-        if (std.testing.allocator_instance.deinit() > 0) {
+        const leaked = if (comptime @hasDecl(std.heap, "SafeAllocator"))
+            std.testing.allocator_instance.deinit() != 0
+        else
+            std.testing.allocator_instance.deinit() == .leak;
+        if (leaked) {
             leak += 1;
             Printer.status(.fail, "\n{s}\n\"{s}\" - Memory Leak\n{s}\n", .{ BORDER, friendly_name, BORDER });
         }
@@ -295,10 +299,10 @@ fn isUnnamed(t: std.builtin.TestFn) bool {
 // std.testing.allocator_instance is undefined until initialized, and
 // beforeAll/afterAll use it too, not just the tests.
 fn initTestAllocator() void {
-    std.testing.allocator_instance = .init(std.heap.page_allocator, .{
+    std.testing.allocator_instance = if (comptime @hasDecl(std.heap, "SafeAllocator")) .init(std.heap.page_allocator, .{
         .canary = 0xc3a701ba,
         .check_write_after_free = true,
-    });
+    }) else .{};
 }
 
 fn isSetup(t: std.builtin.TestFn) bool {

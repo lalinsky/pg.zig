@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("compat.zig");
 const lib = @import("lib.zig");
 
 const types = lib.types;
@@ -143,7 +144,7 @@ pub const Result = struct {
     };
 
     pub fn mapper(self: *Result, comptime T: type, opts: MapperOpts) Mapper(T) {
-        const fnames = @typeInfo(T).@"struct".field_names;
+        const fnames = comptime compat.fieldNames(T);
         var column_indexes: [fnames.len]?usize = undefined;
 
         inline for (fnames, 0..) |fname, i| {
@@ -364,12 +365,11 @@ pub fn RowT(comptime fail_mode: lib.FailMode) type {
 
         fn toUsingOrdinal(self: *const Self, T: type, allocator: ?Allocator) !T {
             var value: T = undefined;
-            const SI = @typeInfo(T).@"struct";
-            inline for (SI.field_names, SI.field_types, SI.field_attrs, 0..) |fname, ftype, fattr, column_index| {
+            inline for (comptime compat.fieldNames(T), comptime compat.fieldTypes(T), comptime compat.fieldDefaults(T), 0..) |fname, ftype, fdefault, column_index| {
                 @field(value, fname) = try self.mapColumn(.{
                     .name = fname,
                     .type = ftype,
-                    .default_value_ptr = fattr.default_value_ptr,
+                    .default_value_ptr = fdefault,
                 }, column_index, allocator);
             }
             return value;
@@ -377,14 +377,13 @@ pub fn RowT(comptime fail_mode: lib.FailMode) type {
 
         fn toUsingName(self: *const Self, T: type, allocator: ?Allocator) !T {
             var value: T = undefined;
-            const SI = @typeInfo(T).@"struct";
 
             const result = self._result;
-            inline for (SI.field_names, SI.field_types, SI.field_attrs) |fname, ftype, fattr| {
+            inline for (comptime compat.fieldNames(T), comptime compat.fieldTypes(T), comptime compat.fieldDefaults(T)) |fname, ftype, fdefault| {
                 @field(value, fname) = try self.mapColumn(.{
                     .name = fname,
                     .type = ftype,
-                    .default_value_ptr = fattr.default_value_ptr,
+                    .default_value_ptr = fdefault,
                 }, result.columnIndex(fname), allocator);
             }
             return value;
@@ -499,8 +498,7 @@ fn mapValue(comptime T: type, value: T, allocator: Allocator) !T {
 }
 
 pub fn Mapper(comptime T: type) type {
-    const SI = @typeInfo(T).@"struct";
-    const fnames = SI.field_names;
+    const fnames = compat.fieldNames(T);
     return struct {
         result: *Result,
         allocator: ?Allocator,
@@ -514,11 +512,11 @@ pub fn Mapper(comptime T: type) type {
             var value: T = undefined;
 
             const allocator = self.allocator;
-            inline for (fnames, SI.field_types, SI.field_attrs, self.column_indexes) |fname, ftype, fattr, optional_column_index| {
+            inline for (fnames, comptime compat.fieldTypes(T), comptime compat.fieldDefaults(T), self.column_indexes) |fname, ftype, fdefault, optional_column_index| {
                 @field(value, fname) = try row.mapColumn(.{
                     .name = fname,
                     .type = ftype,
-                    .default_value_ptr = fattr.default_value_ptr,
+                    .default_value_ptr = fdefault,
                 }, optional_column_index, allocator);
             }
             return value;

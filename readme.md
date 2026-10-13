@@ -10,9 +10,10 @@ It's a running fork, that I try to keep up to date with the upstream master bran
 
 1) Use [tls.zig](https://github.com/ianic/tls.zig) instead of OpenSSL, to allow using the provided `std.Io` implemenation
 2) Use [xsync.zig](https://github.com/lalinsky/xsync.zig) instead of synchronization primitives from the standard library to avoid cancellation issues
+3) Support both Zig 0.16 and 0.17
 
 ## Zig Version
-This is for Zig 0.17.0. See branches for other versions.
+This is for Zig 0.16.0 and 0.17.0. See branches for other versions.
 
 ## Install
 1) Add pg.zig as a dependency in your `build.zig.zon`:

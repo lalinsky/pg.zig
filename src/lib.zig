@@ -1,5 +1,6 @@
 // Exposed within this library
 const std = @import("std");
+const compat = @import("compat.zig");
 
 const build_config = @import("config");
 
@@ -271,7 +272,7 @@ test "public API errors don't include ReadFailed or WriteFailed" {
     };
     @setEvalBranchQuota(100_000);
     inline for (results) |R| {
-        inline for (@typeInfo(@typeInfo(R).error_union.error_set).error_set.error_names.?) |name| {
+        inline for (comptime compat.errorNames(@typeInfo(R).error_union.error_set)) |name| {
             try testing.expectEqual(false, comptime std.mem.eql(u8, name, "ReadFailed"));
             try testing.expectEqual(false, comptime std.mem.eql(u8, name, "WriteFailed"));
         }
