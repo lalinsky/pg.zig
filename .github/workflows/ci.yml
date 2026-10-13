@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        zig-version: ['0.16.0', '0.17.0']
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Zig
+      uses: mlugg/setup-zig@v2
+      with:
+        version: ${{ matrix.zig-version }}
+
+    - name: Check code formatting
+      run: zig fmt --check build.zig build.zig.zon test_runner.zig src
+
+    - name: Generate test certificates
+      run: make ssl
+
+    - name: Start PostgreSQL
+      run: docker compose up -d
+      working-directory: tests
+
+    - name: Wait for PostgreSQL
+      # Check over TCP: the entrypoint's init phase only listens on the socket.
+      run: timeout 120 bash -c 'until docker compose exec -T postgres pg_isready -h 127.0.0.1 -U postgres; do sleep 2; done'
+      working-directory: tests
+
+    - name: Build
+      run: zig build
+
+    - name: Run tests
+      run: zig build test --summary all
+
+    - name: Build example
+      run: zig build
+      working-directory: example
+
+    - name: PostgreSQL logs
+      if: failure()
+      run: docker compose logs postgres
+      working-directory: tests
