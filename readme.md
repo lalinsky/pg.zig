@@ -8,9 +8,10 @@ See or run [example/main.zig](https://github.com/karlseguin/pg.zig/blob/master/e
 
 It's a running fork, that I try to keep up to date with the upstream master branch. There are a few changes to make it work with green thread `std.Io` implementations.
 
-1) Use [tls.zig](https://github.com/ianic/tls.zig) instead of OpenSSL, to allow using the provided `std.Io` implemenation
-2) Use [xsync.zig](https://github.com/lalinsky/xsync.zig) instead of synchronization primitives from the standard library to avoid cancellation issues
+1) Use [tls.zig](https://github.com/ianic/tls.zig) instead of OpenSSL, to allow using the provided `std.Io` implemenation. This was [rejected upstream](https://github.com/karlseguin/pg.zig/pull/132).
+2) Use [xsync.zig](https://github.com/lalinsky/xsync.zig) instead of synchronization primitives from the standard library to avoid cancellation issues. This is temporary.
 3) Support both Zig 0.16 and 0.17
+4) Open pool connections on demand, up to `size`, instead of reconnecting in the background ([upstream PR](https://github.com/karlseguin/pg.zig/pull/149))
 
 ## Zig Version
 This is for Zig 0.16.0 and 0.17.0. See branches for other versions.
