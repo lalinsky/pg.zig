@@ -48,7 +48,7 @@ pub const Listener = struct {
         const buf = try Buffer.init(allocator, opts.write_buffer orelse 2048);
         errdefer buf.deinit();
 
-        const reader = try Reader.init(allocator, opts.read_buffer orelse 4096, stream);
+        const reader = Reader.init(allocator, stream);
         errdefer reader.deinit();
 
         return .{
@@ -92,7 +92,7 @@ pub const Listener = struct {
         // endFlow may free the buffer raw_pg_err points into, so it must run
         // after setErr has copied it; a return expression is evaluated before
         // the defers.
-        defer self._reader.endFlow() catch {};
+        defer self._reader.endFlow();
 
         if (try lib.auth.auth(self._io, &self._stream, &self._buf, &self._reader, opts)) |raw_pg_err| {
             return self.setErr(raw_pg_err);

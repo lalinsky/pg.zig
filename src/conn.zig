@@ -165,7 +165,7 @@ pub const Conn = struct {
         const buf = try Buffer.init(allocator, @max(opts.write_buffer orelse 2048, 128));
         errdefer buf.deinit();
 
-        const reader = try Reader.init(allocator, opts.read_buffer orelse 4096, stream);
+        const reader = Reader.init(allocator, stream);
         errdefer reader.deinit();
 
         const result_state = try Result.State.init(allocator, opts.result_state_size);
@@ -222,9 +222,8 @@ pub const Conn = struct {
         try self._reader.startFlow(null, opts.timeout);
         // endFlow may free the buffer raw_pg_err points into, so it must run
         // after setErr has copied it; a return expression is evaluated before
-        // the defers. Its only failure is OOM, which will surface again on the
-        // next use of the connection.
-        defer self._reader.endFlow() catch {};
+        // the defers.
+        defer self._reader.endFlow();
 
         if (try lib.auth.auth(self._io, &self._stream, &self._buf, &self._reader, opts)) |raw_pg_err| {
             return self.setErr(raw_pg_err);
@@ -283,14 +282,7 @@ pub const Conn = struct {
         }
 
         try self._reader.startFlow(null, null);
-        defer {
-            self._reader.endFlow() catch {
-                // this can only fail in extreme conditions (OOM) and it will only impact
-                // the next query (and if the app is using the pool, the pool will try to
-                // recover from this anyways)
-                self._state = .fail;
-            };
-        }
+        defer self._reader.endFlow();
         var arena_state: std.heap.ArenaAllocator = .init(allocator);
         errdefer arena_state.deinit();
         const arena = arena_state.allocator();
@@ -510,12 +502,7 @@ pub const Conn = struct {
 
         if (values.len == 0) {
             try self._reader.startFlow(opts.allocator, opts.timeout);
-            defer self._reader.endFlow() catch {
-                // this can only fail in extreme conditions (OOM) and it will only impact
-                // the next query (and if the app is using the pool, the pool will try to
-                // recover from this anyways)
-                self._state = .fail;
-            };
+            defer self._reader.endFlow();
             const simple_query = proto.Query{ .sql = sql };
             try simple_query.write(buf);
             // no longer idle, we're now in a query
@@ -616,8 +603,14 @@ pub const Conn = struct {
     // Should not be called directly
     pub fn peekForError(self: *Conn) !void {
         const data = (try self._reader.peekForError()) orelse return;
+        // data is only valid until the next read, so copy it before draining
+        // the trailing ReadyForQuery
+        switch (self.setErr(data)) {
+            error.PG => {},
+            error.OutOfMemory => return error.OutOfMemory,
+        }
         try self.readyForQuery();
-        return self.setErr(data);
+        return error.PG;
     }
 
     // Should not be called directly

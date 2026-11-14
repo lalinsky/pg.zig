@@ -48,61 +48,54 @@ pub const TlsContext = struct {
     }
 };
 
-// Per-connection TLS state, heap-allocated so that it never moves: the
-// tls.Connection points at the socket's reader and writer, and its own reader
-// and writer point at it. The Conn's Stream and the Reader's copy of it share
-// one.
-const TlsState = struct {
-    conn: tls.Connection,
-    // the ciphertext side
-    socket_reader: Io.net.Stream.Reader,
-    socket_writer: Io.net.Stream.Writer,
-    // the cleartext side, unbuffered: Stream.read and Stream.writeAll are
-    // given whole buffers
-    reader: tls.Connection.Reader,
-    writer: tls.Connection.Writer,
-    // backs socket_reader and socket_writer
-    buf: []u8,
-    allocator: Allocator,
-
-    fn deinit(self: *TlsState) void {
-        self.conn.deinit();
-        const allocator = self.allocator;
-        allocator.free(self.buf);
-        allocator.destroy(self);
-    }
-
-    const ReadError = Optional(@FieldType(tls.Connection.Reader, "err")) || Optional(@FieldType(Io.net.Stream.Reader, "err"));
-    const WriteError = Optional(@FieldType(tls.Connection.Writer, "err")) || Optional(@FieldType(Io.net.Stream.Writer, "err"));
-
-    fn Optional(comptime T: type) type {
-        return @typeInfo(T).optional.child;
-    }
-
-    // The error behind the reader's ReadFailed. A failure of the transport is
-    // the socket's own error.
-    fn readError(self: *const TlsState) ReadError {
-        const err = self.reader.err orelse return error.ReadFailed;
-        if (err == error.ReadFailed) {
-            return self.socket_reader.err orelse error.ReadFailed;
-        }
-        return err;
-    }
-
-    fn writeError(self: *const TlsState) WriteError {
-        const err = self.writer.err orelse return error.WriteFailed;
-        if (err == error.WriteFailed) {
-            return self.socket_writer.err orelse error.WriteFailed;
-        }
-        return err;
-    }
-};
-
+// A cheap handle over a connected socket; copies (the Conn's and its
+// Reader's) share one heap-allocated State. The State must never move: the
+// std.Io interfaces handed out by reader() and writer() live in it, and under
+// TLS, the tls.Connection points at the socket's reader and writer in it.
 pub const Stream = struct {
     io: Io,
-    stream: Io.net.Stream,
-    // null for a plaintext (tls = .off) connection
-    tls: if (lib.has_tls) ?*TlsState else void,
+    state: *State,
+
+    // ztls's ReadFailed and WriteFailed only say that its transport, our
+    // socket, failed; getReadError and getWriteError return the socket's
+    // error instead, so they aren't part of these sets.
+    pub const ReadError = Io.net.Stream.Reader.Error || if (lib.has_tls) ErrorSetWithout(OptionalChild(@FieldType(tls.Connection.Reader, "err")), &.{error.ReadFailed}) else error{};
+    pub const WriteError = Io.net.Stream.Writer.Error || if (lib.has_tls) ErrorSetWithout(OptionalChild(@FieldType(tls.Connection.Writer, "err")), &.{error.WriteFailed}) else error{};
+
+    const State = struct {
+        allocator: Allocator,
+        stream: Io.net.Stream,
+        // The socket's reader and writer. On a plaintext connection, these are
+        // what reader() and writer() hand out. Under TLS, they carry ciphertext.
+        socket_reader: Io.net.Stream.Reader,
+        socket_writer: Io.net.Stream.Writer,
+        // The message buffer: backs socket_reader on a plaintext connection,
+        // and the TLS reader otherwise.
+        read_buf: []u8,
+        tls: if (lib.has_tls) ?Tls else void,
+
+        const Tls = struct {
+            conn: tls.Connection,
+            // the cleartext side: what reader() and writer() hand out
+            reader: tls.Connection.Reader,
+            writer: tls.Connection.Writer,
+            // record-sized ciphertext buffers, swapped into socket_reader and
+            // socket_writer
+            buf: []u8,
+        };
+
+        fn deinit(self: *State) void {
+            const allocator = self.allocator;
+            if (comptime lib.has_tls) {
+                if (self.tls) |*t| {
+                    t.conn.deinit();
+                    allocator.free(t.buf);
+                }
+            }
+            allocator.free(self.read_buf);
+            allocator.destroy(self);
+        }
+    };
 
     // `ctx` is shared by the connections of a pool. Without one, a connection
     // that wants TLS loads what it needs itself.
@@ -111,15 +104,39 @@ pub const Stream = struct {
             return error.TlsNotConfigured;
         }
 
-        const stream = try connectSocket(io, opts);
-        errdefer stream.close(io);
+        const socket = try connectSocket(io, opts);
+        errdefer socket.close(io);
 
-        if (comptime lib.has_tls == false) {
-            return .{ .io = io, .stream = stream, .tls = {} };
+        const state = try allocator.create(State);
+        state.* = .{
+            .allocator = allocator,
+            .stream = socket,
+            .socket_reader = undefined,
+            .socket_writer = undefined,
+            .read_buf = &.{},
+            .tls = if (comptime lib.has_tls) null else {},
+        };
+        errdefer state.deinit();
+
+        // a std.Io.Reader needs room for at least a message's 5 byte header
+        state.read_buf = try allocator.alloc(u8, @max(opts.read_buffer orelse 4096, 128));
+        state.socket_reader = socket.reader(io, state.read_buf);
+        // Every write is a complete batch of messages, so the socket writer
+        // needs no buffer of its own.
+        state.socket_writer = socket.writer(io, &.{});
+
+        const self: Stream = .{ .io = io, .state = state };
+        if (comptime lib.has_tls) {
+            if (opts.tls != .off) {
+                try self.startTls(allocator, opts, ctx);
+            }
         }
-        if (opts.tls == .off) {
-            return .{ .io = io, .stream = stream, .tls = null };
-        }
+        return self;
+    }
+
+    fn startTls(self: Stream, allocator: Allocator, opts: Conn.Opts, ctx: ?*const TlsContext) !void {
+        const io = self.io;
+        const state = self.state;
 
         var own_ctx: ?TlsContext = null;
         defer if (own_ctx) |*c| c.deinit();
@@ -128,86 +145,156 @@ pub const Stream = struct {
             break :blk &own_ctx.?;
         };
 
-        // PostgreSQL TLS starts off as a plain connection which we upgrade
-        try writeStream(stream, io, &.{ 0, 0, 0, 8, 4, 210, 22, 47 });
-        var buf = [1]u8{0};
-        _ = try readStream(stream, io, &buf);
-        if (buf[0] != 'S') {
+        // PostgreSQL TLS starts off as a plain connection which we upgrade:
+        // send the SSLRequest and require an 'S' (SSL supported) reply.
+        const w = &state.socket_writer.interface;
+        w.writeAll(&.{ 0, 0, 0, 8, 4, 210, 22, 47 }) catch return self.getWriteError();
+        w.flush() catch return self.getWriteError();
+        const r = &state.socket_reader.interface;
+        const reply = r.takeByte() catch |err| return switch (err) {
+            error.EndOfStream => error.Closed,
+            error.ReadFailed => self.getReadError(),
+        };
+        if (reply != 'S') {
             return error.SSLNotSupportedByServer;
         }
 
-        const state = try allocator.create(TlsState);
-        errdefer allocator.destroy(state);
-        state.allocator = allocator;
-        state.buf = try allocator.alloc(u8, tls.input_buffer_len + tls.output_buffer_len);
-        errdefer allocator.free(state.buf);
-        state.socket_reader = stream.reader(io, state.buf[0..tls.input_buffer_len]);
-        state.socket_writer = stream.writer(io, state.buf[tls.input_buffer_len..]);
+        // A conforming server sends nothing after the 'S' until it has our
+        // ClientHello, so anything already buffered was injected by a
+        // man-in-the-middle, and must not be read as if it came over TLS
+        // (CVE-2021-23214 in libpq).
+        if (r.bufferedLen() != 0) {
+            return error.UnexpectedDataAfterSSLResponse;
+        }
+
+        // once assigned, the caller's errdefer (State.deinit) owns the buffer
+        const buf = try allocator.alloc(u8, tls.input_buffer_len + tls.output_buffer_len);
+        state.tls = .{ .conn = undefined, .reader = undefined, .writer = undefined, .buf = buf };
+        const t = &state.tls.?;
+
+        // The socket side now carries ciphertext and needs room for a whole
+        // record, so it gets the TLS buffers; the message buffer moves to the
+        // cleartext side below.
+        r.buffer = buf[0..tls.input_buffer_len];
+        r.seek = 0;
+        r.end = 0;
+        w.buffer = buf[tls.input_buffer_len..];
 
         // An IP address is checked against the certificate's IP addresses,
         // and sent as no SNI.
         const host = opts.host orelse DEFAULT_HOST;
-        state.conn = tls.client(&state.socket_reader.interface, &state.socket_writer.interface, .{
+        t.conn = tls.client(r, w, .{
             .io = io,
             .gpa = allocator,
             .host = host,
             .root_ca = if (tls_ctx.trust) |*trust| trust else null,
             .insecure_skip_verify = tls_ctx.trust == null,
-        }) catch |err| switch (err) {
-            error.ReadFailed => return state.socket_reader.err orelse err,
-            error.WriteFailed => return state.socket_writer.err orelse err,
-            else => return err,
+        }) catch |err| {
+            // State.deinit would deinit the connection that wasn't made
+            state.tls = null;
+            allocator.free(buf);
+            return switch (err) {
+                // ztls reports its transport failing as ReadFailed and
+                // WriteFailed; return the socket's error (e.g. Canceled), as a
+                // plaintext connection would
+                error.ReadFailed => state.socket_reader.err orelse error.Unexpected,
+                error.WriteFailed => state.socket_writer.err orelse error.Unexpected,
+                error.EndOfStream => error.Closed,
+                else => |e| e,
+            };
         };
-        state.reader = state.conn.reader(&.{});
-        state.writer = state.conn.writer(&.{});
-
-        return .{ .io = io, .stream = stream, .tls = state };
+        t.reader = t.conn.reader(state.read_buf);
+        t.writer = t.conn.writer(&.{});
     }
 
     pub fn close(self: *Stream) void {
+        const state = self.state;
         if (comptime lib.has_tls) {
-            if (self.tls) |state| {
+            if (state.tls) |*t| {
                 // Best-effort close_notify, shielded from cancellation like the
                 // Terminate message, so teardown can't be interrupted.
                 const prev = self.io.swapCancelProtection(.blocked);
                 defer _ = self.io.swapCancelProtection(prev);
-                state.conn.close() catch {};
-                state.deinit();
-                self.tls = null;
+                t.conn.close() catch {};
             }
         }
-        self.stream.close(self.io);
+        state.stream.close(self.io);
+        state.deinit();
     }
 
     pub fn shutdown(self: *const Stream, how: Io.net.ShutdownHow) !void {
-        return self.stream.shutdown(self.io, how);
+        return self.state.stream.shutdown(self.io, how);
     }
 
-    pub fn writeAll(self: *Stream, data: []const u8) !void {
+    pub fn reader(self: Stream) *Io.Reader {
+        const state = self.state;
         if (comptime lib.has_tls) {
-            if (self.tls) |state| {
-                const w = &state.writer.interface;
-                w.writeAll(data) catch return state.writeError();
-                w.flush() catch return state.writeError();
-                return;
-            }
+            if (state.tls) |*t| return &t.reader.interface;
         }
-        return writeStream(self.stream, self.io, data);
+        return &state.socket_reader.interface;
     }
 
-    pub fn read(self: *Stream, buf: []u8) !usize {
+    pub fn writer(self: Stream) *Io.Writer {
+        const state = self.state;
         if (comptime lib.has_tls) {
-            if (self.tls) |state| {
-                var vecs: [1][]u8 = .{buf};
-                return state.reader.interface.readVec(&vecs) catch |err| switch (err) {
-                    error.EndOfStream => return error.EndOfStream,
-                    error.ReadFailed => return state.readError(),
+            if (state.tls) |*t| return &t.writer.interface;
+        }
+        return &state.socket_writer.interface;
+    }
+
+    pub fn writeAll(self: *Stream, data: []const u8) WriteError!void {
+        const w = self.writer();
+        w.writeAll(data) catch return self.getWriteError();
+        w.flush() catch return self.getWriteError();
+    }
+
+    // std.Io.Reader and Writer report every failure as ReadFailed or
+    // WriteFailed, and leave the real error on the implementation; these
+    // return it, like std.http.Client.Connection.getReadError. Only
+    // meaningful right after such a failure. Under TLS, a ReadFailed or
+    // WriteFailed from ztls means that its transport, our socket, failed.
+    pub fn getReadError(self: Stream) ReadError {
+        const state = self.state;
+        if (comptime lib.has_tls) {
+            if (state.tls) |*t| {
+                if (t.reader.err) |err| switch (err) {
+                    error.ReadFailed => {},
+                    else => |e| return e,
                 };
             }
         }
-        return readStream(self.stream, self.io, buf);
+        return state.socket_reader.err orelse error.Unexpected;
+    }
+
+    pub fn getWriteError(self: Stream) WriteError {
+        const state = self.state;
+        if (comptime lib.has_tls) {
+            if (state.tls) |*t| {
+                if (t.writer.err) |err| switch (err) {
+                    error.WriteFailed => {},
+                    else => |e| return e,
+                };
+            }
+        }
+        return state.socket_writer.err orelse error.Unexpected;
     }
 };
+
+fn OptionalChild(comptime T: type) type {
+    return @typeInfo(T).optional.child;
+}
+
+// E without the errors in `excluded`
+fn ErrorSetWithout(comptime E: type, comptime excluded: []const anyerror) type {
+    var result = error{};
+    outer: for (@typeInfo(E).error_set.error_names.?) |name| {
+        for (excluded) |x| {
+            if (std.mem.eql(u8, name, @errorName(x))) continue :outer;
+        }
+        result = result || @TypeOf(@field(anyerror, name));
+    }
+    return result;
+}
 
 fn connectSocket(io: Io, opts: Conn.Opts) !Io.net.Stream {
     const host = opts.host orelse DEFAULT_HOST;
@@ -336,28 +423,6 @@ fn setsockopt(fd: posix.socket_t, level: i32, optname: u32, opt: []const u8) !vo
         .INSUFFICIENT_RESOURCES => return error.SystemResources,
         else => |status| return std.os.windows.unexpectedStatus(status),
     }
-}
-
-fn readStream(stream: Io.net.Stream, io: Io, buf: []u8) !usize {
-    var vecs: [1][]u8 = .{buf};
-    var reader = stream.reader(io, &.{});
-    const r = &reader.interface;
-    return r.readVec(&vecs) catch |err| switch (err) {
-        error.ReadFailed => return reader.err orelse err,
-        else => return err,
-    };
-}
-
-fn writeStream(stream: Io.net.Stream, io: Io, data: []const u8) !void {
-    var buf: [1024]u8 = undefined;
-    var writer = stream.writer(io, &buf);
-    const w = &writer.interface;
-    w.writeAll(data) catch |err| switch (err) {
-        error.WriteFailed => return writer.err orelse err,
-    };
-    w.flush() catch |err| switch (err) {
-        error.WriteFailed => return writer.err orelse err,
-    };
 }
 
 // Sends a best-effort Terminate ('X') message, shielded from cancellation so
