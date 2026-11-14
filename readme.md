@@ -4,6 +4,19 @@ A native PostgresSQL driver / client for Zig. Supports [LISTEN](#listen--notify)
 
 See or run [example/main.zig](https://github.com/karlseguin/pg.zig/blob/master/example/main.zig) for a number of examples.
 
+## This fork
+
+This fork exists to support asynchronous `std.Io` implementations, such as [zio](https://github.com/lalinsky/zio), where a connection's I/O must go through the `std.Io` that was passed in, rather than block the thread. It follows upstream's master branch, with two changes:
+
+1) It reads from and writes to the socket through `std.Io.Reader` and `std.Io.Writer`.
+2) It uses [ztls](https://github.com/lalinsky/ztls) for TLS instead of OpenSSL, which reads and writes the socket's file descriptor itself. See [TLS](#tls).
+
+The master branch is regularly rebased onto upstream, so its commits don't stay around. Depend on a [tag](https://github.com/lalinsky/pg.zig/tags), which stays where it is, such as the latest one:
+
+```bash
+zig fetch --save "git+https://github.com/lalinsky/pg.zig#v2026.11.14.0"
+```
+
 ## Zig Version
 This is for Zig 0.17.0. See branches for other versions.
 
