@@ -6,14 +6,12 @@ const proto = lib.proto;
 const types = lib.types;
 const Pool = lib.Pool;
 const Stmt = lib.Stmt;
-const SSLCtx = lib.SSLCtx;
 const Reader = lib.Reader;
 const Result = lib.Result;
 const Stream = lib.Stream;
 const Timeout = lib.Timeout;
 const QueryRow = lib.QueryRow;
 const QueryRowUnsafe = lib.QueryRowUnsafe;
-const has_openssl = lib.has_openssl;
 
 const os = std.os;
 const Allocator = std.mem.Allocator;
@@ -21,10 +19,6 @@ const ArenaAllocator = std.heap.ArenaAllocator;
 const Io = std.Io;
 
 pub const Conn = struct {
-    // If we own the ssl context (which only happens if the connection is
-    // created directly and NOT through a pool), then we have to free it
-    _ssl_ctx: ?*SSLCtx,
-
     // If we get a postgreSQL error, this will be set.
     err: ?proto.Error,
 
@@ -85,7 +79,6 @@ pub const Conn = struct {
         read_buffer: ?u16 = null,
         result_state_size: u16 = 32,
         tls: TLS = .off,
-        _hostz: ?[:0]const u8 = null,
 
         // tcp keepalive settings (null timer = OS default)
         keepalive: bool = true,
@@ -159,24 +152,14 @@ pub const Conn = struct {
     }
 
     pub fn open(io: Io, allocator: Allocator, opts: Opts) !Conn {
-        var ssl_ctx: ?*SSLCtx = null;
-        switch (opts.tls) {
-            .off => {},
-            else => |tls_config| {
-                if (comptime lib.has_openssl == false) {
-                    return error.OpenSSLNotConfigured;
-                }
-                ssl_ctx = try lib.initializeSSLContext(tls_config);
-            },
-        }
-        errdefer lib.freeSSLContext(ssl_ctx);
-        var conn = try openWithContext(io, allocator, opts, ssl_ctx);
-        conn._ssl_ctx = ssl_ctx;
-        return conn;
+        return openWithContext(io, allocator, opts, null);
     }
 
-    pub fn openWithContext(io: Io, allocator: Allocator, opts: Opts, ssl_ctx: ?*SSLCtx) !Conn {
-        var stream = try Stream.connect(io, allocator, opts, ssl_ctx);
+    // `tls_ctx` holds what TLS connections with the same options can share,
+    // and must outlive the connection's handshake. Without one, the
+    // connection loads it itself.
+    pub fn openWithContext(io: Io, allocator: Allocator, opts: Opts, tls_ctx: ?*const lib.TlsContext) !Conn {
+        var stream = try Stream.connect(io, allocator, opts, tls_ctx);
         errdefer stream.close();
 
         const buf = try Buffer.init(allocator, @max(opts.write_buffer orelse 2048, 128));
@@ -194,7 +177,6 @@ pub const Conn = struct {
         return .{
             .err = null,
             ._buf = buf,
-            ._ssl_ctx = null,
             ._reader = reader,
             ._stream = stream,
             ._err_data = null,
@@ -218,7 +200,6 @@ pub const Conn = struct {
         self._result_state.deinit(allocator);
 
         lib.sendTerminate(&self._stream, self._io);
-        lib.freeSSLContext(self._ssl_ctx);
         self._stream.close();
 
         var it = self._prepared_statements.valueIterator();
@@ -2506,6 +2487,11 @@ test "open URI" {
 }
 
 test "Conn: TLS required" {
+    if (comptime lib.has_tls == false) {
+        try t.expectError(error.TlsNotConfigured, Conn.open(t.io, t.allocator, .{ .tls = .require }));
+        return;
+    }
+
     {
         var conn = try Conn.open(t.io, t.allocator, .{ .tls = .off });
         defer conn.deinit();
@@ -2520,10 +2506,18 @@ test "Conn: TLS required" {
 }
 
 test "Conn: TLS verify-full" {
-    try t.expectError(error.SSLCertificationVerificationError, Conn.open(t.io, t.allocator, .{ .tls = .{ .verify_full = null } }));
+    if (comptime lib.has_tls == false) {
+        return error.SkipZigTest;
+    }
+
+    // the test server's certificate isn't in the system's trust store
+    try t.expectError(error.CertificateIssuerNotFound, Conn.open(t.io, t.allocator, .{ .host = "localhost", .tls = .{ .verify_full = null } }));
+
+    // the certificate is for localhost, not for the IP address
+    try t.expectError(error.CertificateHostMismatch, Conn.open(t.io, t.allocator, .{ .host = "127.0.0.1", .tls = .{ .verify_full = "tests/root.crt" } }));
 
     {
-        var conn = try t.connect(.{ .tls = Conn.Opts.TLS{ .verify_full = "tests/root.crt" }, .username = "pgz_user_ssl", .password = "pgz_user_ssl_pw" });
+        var conn = try t.connect(.{ .host = "localhost", .tls = Conn.Opts.TLS{ .verify_full = "tests/root.crt" }, .username = "pgz_user_ssl", .password = "pgz_user_ssl_pw" });
         defer conn.deinit();
     }
 }

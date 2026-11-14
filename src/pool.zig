@@ -4,7 +4,6 @@ const lib = @import("lib.zig");
 const log = lib.log;
 const Conn = lib.Conn;
 const Result = lib.Result;
-const SSLCtx = lib.SSLCtx;
 const QueryRow = lib.QueryRow;
 const QueryRowUnsafe = lib.QueryRowUnsafe;
 const Listener = @import("listener.zig").Listener;
@@ -27,7 +26,7 @@ pub const Pool = struct {
     _allocator: Allocator,
     _mutex: Io.Mutex,
     _cond: Io.Condition,
-    _ssl_ctx: ?*lib.SSLCtx,
+    _tls_ctx: ?lib.TlsContext,
     // not to be used outside of init
     _arena: ArenaAllocator,
 
@@ -85,26 +84,19 @@ pub const Pool = struct {
             opts_copy.auth.startup_parameters = owned;
         }
 
-        var ssl_ctx: ?*SSLCtx = null;
-        if (comptime lib.has_openssl) {
-            switch (opts.connect.tls) {
-                .off => {},
-                else => |tls_config| {
-                    if (opts_copy.connect.host) |h| {
-                        opts_copy.connect._hostz = try aa.dupeSentinel(u8, h, 0);
-                    }
-                    // the cert path is re-read on every (re)connect, so own it too
-                    switch (tls_config) {
-                        .verify_full => |path| if (path) |p| {
-                            opts_copy.connect.tls = .{ .verify_full = try aa.dupe(u8, p) };
-                        },
-                        else => {},
-                    }
-                    ssl_ctx = try lib.initializeSSLContext(tls_config);
-                },
+        if (opts.connect.tls == .verify_full) {
+            if (opts.connect.tls.verify_full) |p| {
+                opts_copy.connect.tls = .{ .verify_full = try aa.dupe(u8, p) };
             }
         }
-        errdefer lib.freeSSLContext(ssl_ctx);
+
+        // the certificates to trust are loaded once, for all connections and
+        // listeners
+        var tls_ctx: ?lib.TlsContext = switch (opts.connect.tls) {
+            .off => null,
+            else => |tls_config| try lib.TlsContext.init(io, allocator, tls_config),
+        };
+        errdefer if (tls_ctx) |*c| c.deinit();
         const connect_on_init_count = opts.connect_on_init_count orelse size;
 
         pool.* = .{
@@ -114,7 +106,7 @@ pub const Pool = struct {
             ._conns = conns,
             ._arena = arena,
             ._opts = opts_copy,
-            ._ssl_ctx = ssl_ctx,
+            ._tls_ctx = tls_ctx,
             ._open = connect_on_init_count,
             ._allocator = allocator,
             ._available = connect_on_init_count,
@@ -142,7 +134,7 @@ pub const Pool = struct {
             conn.deinit();
             allocator.destroy(conn);
         }
-        lib.freeSSLContext(self._ssl_ctx);
+        if (self._tls_ctx) |*c| c.deinit();
         self._arena.deinit();
     }
 
@@ -236,7 +228,8 @@ pub const Pool = struct {
     }
 
     pub fn newListener(self: *Pool) !Listener {
-        var listener = try Listener.open(self._io, self._allocator, self._opts.connect);
+        const tls_ctx: ?*const lib.TlsContext = if (self._tls_ctx) |*c| c else null;
+        var listener = try Listener.openWithContext(self._io, self._allocator, self._opts.connect, tls_ctx);
         try listener.auth(self._opts.auth);
         return listener;
     }
@@ -314,7 +307,8 @@ fn newConnection(pool: *Pool, log_failure: bool) !*Conn {
     };
     errdefer allocator.destroy(conn);
 
-    conn.* = Conn.open(io, allocator, opts.connect) catch |err| {
+    const tls_ctx: ?*const lib.TlsContext = if (pool._tls_ctx) |*c| c else null;
+    conn.* = Conn.openWithContext(io, allocator, opts.connect, tls_ctx) catch |err| {
         if (log_failure) log.err("connect error: {}", .{err});
         return err;
     };
@@ -367,6 +361,40 @@ test "Pool" {
         const affected = try c1.exec("delete from pool_test", .{});
         try t.expectEqual(1500, affected.?);
     }
+}
+
+test "Pool: TLS" {
+    if (comptime lib.has_tls == false) {
+        try t.expectError(error.TlsNotConfigured, Pool.init(t.io, t.allocator, .{
+            .size = 1,
+            .connect = .{ .tls = .require },
+            .auth = t.authOpts(.{}),
+        }));
+        return;
+    }
+
+    // pgz_user_ssl can only connect over TLS, so the pool's connections and
+    // its listener all have to use it
+    var pool = try Pool.init(t.io, t.allocator, .{
+        .size = 2,
+        .connect = .{ .host = "localhost", .tls = .{ .verify_full = "tests/root.crt" } },
+        .auth = t.authOpts(.{ .username = "pgz_user_ssl", .password = "pgz_user_ssl_pw" }),
+    });
+    defer pool.deinit();
+
+    const c1 = try pool.acquire();
+    defer c1.release();
+    const c2 = try pool.acquire();
+    defer c2.release();
+    for ([_]*Conn{ c1, c2 }) |c| {
+        var row = (try c.row("select ssl from pg_stat_ssl where pid = pg_backend_pid()", .{})).?;
+        defer row.deinit() catch {};
+        try t.expectEqual(true, try row.get(bool, 0));
+    }
+
+    var l = try pool.newListener();
+    defer l.deinit();
+    try l.listen("pool_tls", .{});
 }
 
 test "Pool: grows on demand" {

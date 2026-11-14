@@ -667,36 +667,42 @@ The metrics are:
 * `pg_alloc_columns` - counts the number of columns states that were allocated. This indicates that your queries are returning more columns than `result_state_size`. If this happens often, consider increasing `result_state_size`.
 * `pg_alloc_reader` - counts the number of bytes allocated while reading messages from PostgreSQL. This generally happens as a result of large result (e.g. selecting large text fields). Controlled by the `read_buffer` configuration option.
 
-## TLS (Experimental)
-TLS is supported via openssl. When loading the module, you must enable openssl by including at least 1 openssl setting:
+## TLS
+TLS is supported via [ztls](https://github.com/lalinsky/ztls), which runs on top of whatever `std.Io` implementation you use. It isn't built by default. Enable it with the `tls` option when loading the module:
 
 ```zig
 const pg_module = b.dependency("pg", .{
   .target = target,
   .optimize = optimize,
-  .openssl_lib_name = @as([]const u8, "ssl"),
-  .openssl_lib_path = std.Build.LazyPath{.cwd_relative = "/path/to/openssl/lib"},
-  .openssl_include_path = std.Build.LazyPath{.cwd_relative = "/path/to/openssl/include"},
+  .tls = .ztls,
 }).module("pg")
 ```
 
-When not specified, the system defaults are use for the library and include paths. These should only be set if openssl is installed in a non-default location. In most cases specifying `.openssl_lib_name = "ssl"` or, for some systems `.openssl_lib_name = "openssl"` should be enough.
+* `.none` - no TLS (the default). Connecting with TLS fails with `error.TlsNotConfigured`, and ztls isn't fetched or built.
+* `.ztls` - ztls's native engine: the TLS protocol is implemented in Zig, the cryptography and certificate verification come from AWS-LC.
+* `.libssl` - ztls on top of AWS-LC's libssl, for servers that need older TLS versions or cipher suites. It needs a C++ runtime.
 
-Set the connection's `tls` option to either `.required` or `.{verify_full = null}`. When using a custom root certificate, specify the path: `.{verify_full = "/path/to/root.crt"}`.
+AWS-LC is built from source by the Zig build system, which takes a while the first time.
+
+Set the connection's `tls` option to either `.require` or `.{ .verify_full = null }`:
+
+* `.require` - encrypt the connection but do not verify the server's certificate.
+* `.{ .verify_full = null }` - verify the server's certificate against the system trust store.
+* `.{ .verify_full = "/path/to/root.crt" }` - verify against the certificates in a PEM file.
+
+`verify_full` checks the certificate against the connection's `host`, like libpq's `sslmode=verify-full`: a hostname against the certificate's DNS names, an IP address against its IP addresses. A pool loads the certificates once, when it is created.
 
 ```zig
-var pool = try pg.Pool.init(allocator, .{
-  .connect = .{ .port = 5432, .host = "ip_or_hostname", .tls = .{.verify_full = null}},
+var pool = try pg.Pool.init(io, allocator, .{
+  .connect = .{ .port = 5432, .host = "hostname", .tls = .{ .verify_full = null } },
   .auth = .{ .... },
   .size = 5,
 });
 
 // OR
 const uri = try std.Uri.parse("postgresql://user:password@hostname/DBNAME?sslmode=require");
-var pool = try pg.Pool.initUri(allocator, uri, 10, 5_000);
+var pool = try pg.Pool.initUri(io, allocator, uri, .{ .size = 10, .timeout = 5_000 });
 ```
-
-In your main file, you can define a global `pub const pg_stderr_tls = true;` to have pg.zig print possible TLS-related errors to stderr. Alternatively, if you get an error, you `pg.printSSLError();` to hopefully print an error message to stderr which can be included in a ticket. This can safely be called in a `catch` clause, and will display nothing if the error is NOT SSL-related. Note that using the global `pg_stderr_tls` is more likely to print useful information in the case of certification verification problems.
 
 ## Enabling Column Names by Default
 

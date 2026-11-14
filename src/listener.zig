@@ -37,7 +37,12 @@ pub const Listener = struct {
     _io: Io,
 
     pub fn open(io: Io, allocator: Allocator, opts: Conn.Opts) !Listener {
-        var stream = try Stream.connect(io, allocator, opts, null);
+        return openWithContext(io, allocator, opts, null);
+    }
+
+    // See Conn.openWithContext.
+    pub fn openWithContext(io: Io, allocator: Allocator, opts: Conn.Opts, tls_ctx: ?*const lib.TlsContext) !Listener {
+        var stream = try Stream.connect(io, allocator, opts, tls_ctx);
         errdefer stream.close();
 
         const buf = try Buffer.init(allocator, opts.write_buffer orelse 2048);

@@ -1,5 +1,7 @@
 const std = @import("std");
 
+const TlsOption = enum { none, ztls, libssl };
+
 pub fn build(b: *std.Build) !void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -7,27 +9,11 @@ pub fn build(b: *std.Build) !void {
     // setup our dependencies
     const dep_opts = .{ .target = target, .optimize = optimize };
 
-    const openssl_lib_name = b.option([]const u8, "openssl_lib_name", "");
-    const openssl_lib_path = b.option(std.Build.LazyPath, "openssl_lib_path", "");
-    const openssl_include_path = b.option(std.Build.LazyPath, "openssl_include_path", "");
-    const openssl = b.option(bool, "openssl", "Enable OpenSSL/TLS support") orelse
-        (openssl_lib_name != null or openssl_lib_path != null or openssl_include_path != null);
-
-    // When openssl is not enabled, skip translate-c entirely and substitute
-    // an empty stub module. Otherwise the build fails on hosts/targets where
-    // <openssl/ssl.h> isn't reachable — e.g. when -Dtarget switches Zig into
-    // cross-compile mode and stops searching the system include paths.
-    const openssl_module = if (openssl) blk: {
-        const Translator = @import("translate_c").Translator;
-        const translate_c = b.dependency("translate_c", .{});
-        const t: Translator = .init(translate_c, .{
-            .c_source_file = b.path("src/openssl.h"),
-            .target = target,
-            .optimize = optimize,
-        });
-        if (openssl_include_path) |p| t.addIncludePath(p);
-        break :blk t.mod;
-    } else b.createModule(.{ .root_source_file = b.path("src/openssl_stub.zig") });
+    const tls_option = b.option(
+        TlsOption,
+        "tls",
+        "TLS: none (default), ztls (native ztls), or libssl (ztls on AWS-LC's libssl)",
+    ) orelse .none;
 
     // Expose this as a module that others can import
     const pg_module = b.addModule("pg", .{
@@ -37,16 +23,9 @@ pub fn build(b: *std.Build) !void {
         .imports = &.{
             .{ .name = "buffer", .module = b.dependency("buffer", dep_opts).module("buffer") },
             .{ .name = "metrics", .module = b.dependency("metrics", dep_opts).module("metrics") },
-            .{ .name = "openssl", .module = openssl_module },
         },
     });
-
-    if (openssl) {
-        if (openssl_lib_path) |p| pg_module.addLibraryPath(p);
-        pg_module.linkSystemLibrary("crypto", .{});
-        pg_module.linkSystemLibrary(openssl_lib_name orelse "ssl", .{});
-        pg_module.link_libc = true;
-    }
+    const has_tls = addTls(b, pg_module, tls_option, target, optimize);
 
     var column_names = false;
     const column_names_opt = b.option(bool, "column_names", "");
@@ -57,22 +36,12 @@ pub fn build(b: *std.Build) !void {
 
     {
         const options = b.addOptions();
-        options.addOption(bool, "openssl", openssl);
+        options.addOption(bool, "tls", has_tls);
         options.addOption(bool, "column_names", column_names);
         pg_module.addOptions("config", options);
     }
 
     {
-        // test step — always built with openssl enabled
-        const Translator = @import("translate_c").Translator;
-        const translate_c = b.dependency("translate_c", .{});
-        const t: Translator = .init(translate_c, .{
-            .c_source_file = b.path("src/openssl.h"),
-            .target = target,
-            .optimize = optimize,
-        });
-        if (openssl_include_path) |p| t.addIncludePath(p);
-
         const lib_test = b.addTest(.{
             .root_module = b.createModule(.{
                 .target = target,
@@ -81,20 +50,16 @@ pub fn build(b: *std.Build) !void {
                 .imports = &.{
                     .{ .name = "buffer", .module = b.dependency("buffer", dep_opts).module("buffer") },
                     .{ .name = "metrics", .module = b.dependency("metrics", dep_opts).module("metrics") },
-                    .{ .name = "openssl", .module = t.mod },
                 },
             }),
             .use_llvm = true,
             .test_runner = .{ .path = b.path("test_runner.zig"), .mode = .simple },
         });
-        if (openssl_lib_path) |p|
-            lib_test.root_module.addLibraryPath(p);
-        lib_test.root_module.linkSystemLibrary("crypto", .{});
-        lib_test.root_module.linkSystemLibrary("ssl", .{});
+        const test_has_tls = addTls(b, lib_test.root_module, tls_option, target, optimize);
 
         {
             const options = b.addOptions();
-            options.addOption(bool, "openssl", true);
+            options.addOption(bool, "tls", test_has_tls);
             options.addOption(bool, "column_names", false);
             lib_test.root_module.addOptions("config", options);
         }
@@ -104,5 +69,22 @@ pub fn build(b: *std.Build) !void {
 
         const test_step = b.step("test", "Run unit tests");
         test_step.dependOn(&run_test.step);
+    }
+}
+
+// ztls is a lazy dependency, fetched and built only when TLS is on; `libssl`
+// builds it with its libssl engine. Returns whether `module` has TLS.
+fn addTls(b: *std.Build, module: *std.Build.Module, tls_option: TlsOption, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) bool {
+    switch (tls_option) {
+        .none => return false,
+        .ztls, .libssl => {
+            const ztls = b.lazyDependency("ztls", .{
+                .target = target,
+                .optimize = optimize,
+                .impl = @as(enum { native, libssl }, if (tls_option == .libssl) .libssl else .native),
+            }) orelse return true;
+            module.addImport("tls", ztls.module("ztls"));
+            return true;
+        },
     }
 }
