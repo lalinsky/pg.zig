@@ -72,6 +72,8 @@ while (try result.next()) |row| {
 ## Pool
 The pool holds up to `size` database connections. The `acquire()` method is used to retrieve a connection from the pool. When no idle connection is available and the pool holds fewer than `size` connections, `acquire()` opens a new one. A connection released in an invalid state (e.g. after an error mid-query) is closed, and a new one is opened the next time one is needed.
 
+When every connection is in use, `acquire()` waits, and waiting tasks are served in the order they started waiting: a released connection goes straight to the task that has waited longest, so one that calls `acquire()` later can't take it first.
+
 ### init(io: std.Io, allocator: std.mem.allocator, opts: Opts) !\*Pool
 Initializes a connection pool. Pool options are:
 

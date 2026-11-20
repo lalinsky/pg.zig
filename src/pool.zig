@@ -25,7 +25,11 @@ pub const Pool = struct {
     _open: usize,
     _allocator: Allocator,
     _mutex: Io.Mutex,
-    _cond: Io.Condition,
+    // Tasks blocked in acquire, oldest first. A released connection, or a slot
+    // given up in _open, goes straight to the oldest waiter, so a task that
+    // arrives later can't take it first. While the list is not empty, nothing
+    // is free: _available == 0 and _open == _conns.len.
+    _waiters: std.DoublyLinkedList,
     _tls_ctx: ?lib.TlsContext,
     // not to be used outside of init
     _arena: ArenaAllocator,
@@ -101,8 +105,8 @@ pub const Pool = struct {
 
         pool.* = .{
             ._io = io,
-            ._cond = .init,
             ._mutex = .init,
+            ._waiters = .{},
             ._conns = conns,
             ._arena = arena,
             ._opts = opts_copy,
@@ -129,6 +133,8 @@ pub const Pool = struct {
     }
 
     pub fn deinit(self: *Pool) void {
+        // a waiter lives on its task's stack and would be left blocked
+        std.debug.assert(self._waiters.first == null);
         const allocator = self._allocator;
         for (self._conns[0..self._available]) |conn| {
             conn.deinit();
@@ -137,6 +143,22 @@ pub const Pool = struct {
         if (self._tls_ctx) |*c| c.deinit();
         self._arena.deinit();
     }
+
+    // A task blocked in acquire. Lives on that task's stack, so it must not be
+    // touched once the task can return: everything that writes `grant` and
+    // signals `cond` does so with the mutex held.
+    const Waiter = struct {
+        node: std.DoublyLinkedList.Node = .{},
+        cond: Io.Condition = .init,
+        grant: ?Grant = null,
+    };
+
+    // What a waiter is handed: an idle connection, or a slot in _open to open
+    // a new connection in.
+    const Grant = union(enum) {
+        conn: *Conn,
+        slot,
+    };
 
     pub fn acquire(self: *Pool) !*Conn {
         const conns = self._conns;
@@ -147,41 +169,72 @@ pub const Pool = struct {
         });
 
         try self._mutex.lock(io);
-        // null: the pool is empty but below its size, and we reserved a slot
-        // for a new connection, which we open outside the lock
+        // null: we hold a slot in _open for a new connection, which we open
+        // outside the lock
         const idle: ?*Conn = blk: {
             errdefer self._mutex.unlock(io);
 
-            var timed_out = false;
-            while (true) {
-                const available = self._available;
-                if (available > 0) {
-                    const index = available - 1;
-                    self._available = index;
-                    break :blk conns[index];
-                }
+            const available = self._available;
+            if (available > 0) {
+                const index = available - 1;
+                self._available = index;
+                break :blk conns[index];
+            }
 
-                if (self._open < conns.len) {
-                    self._open += 1;
-                    break :blk null;
-                }
+            if (self._open < conns.len) {
+                self._open += 1;
+                break :blk null;
+            }
 
-                lib.metrics.poolEmpty();
+            lib.metrics.poolEmpty();
 
-                // checked only after looking for a connection one more time
-                if (timed_out) {
-                    return error.Timeout;
-                }
-
-                self._cond.waitTimeout(io, &self._mutex, .{ .deadline = deadline }) catch |err| switch (err) {
-                    error.Timeout => timed_out = true,
-                    error.Canceled => |e| return e,
+            // Nothing is free, so nobody waiting was skipped: whatever frees up
+            // next goes to the oldest waiter, and we wait behind the rest.
+            var waiter: Waiter = .{};
+            self._waiters.append(&waiter.node);
+            while (waiter.grant == null) {
+                waiter.cond.waitTimeout(io, &self._mutex, .{ .deadline = deadline }) catch |err| {
+                    // given something at the same time as we timed out or were
+                    // canceled; the giver already took us off the list
+                    if (waiter.grant) |grant| {
+                        if (err == error.Canceled) {
+                            self.give(grant);
+                            return err;
+                        }
+                        break;
+                    }
+                    self._waiters.remove(&waiter.node);
+                    return err;
                 };
             }
+            break :blk switch (waiter.grant.?) {
+                .conn => |conn| conn,
+                .slot => null,
+            };
         };
         self._mutex.unlock(io);
 
         return idle orelse self.openConnection();
+    }
+
+    // Hands a connection, or a slot in _open, to the oldest waiter, or makes
+    // it free when nobody waits. The mutex must be held: a waiter can return
+    // from acquire, and its stack frame be gone, as soon as it's released.
+    fn give(self: *Pool, grant: Grant) void {
+        if (self._waiters.popFirst()) |node| {
+            std.debug.assert(self._available == 0 and self._open == self._conns.len);
+            const waiter: *Waiter = @fieldParentPtr("node", node);
+            waiter.grant = grant;
+            waiter.cond.signal(self._io);
+            return;
+        }
+        switch (grant) {
+            .conn => |conn| {
+                self._conns[self._available] = conn;
+                self._available += 1;
+            },
+            .slot => self._open -= 1,
+        }
     }
 
     // Opens a connection for a slot that acquire already reserved in _open.
@@ -200,31 +253,26 @@ pub const Pool = struct {
             // conn should always be idle when being released. It's possible we can
             // recover from this (e.g. maybe we just need to read until we get a
             // ReadyForQuery), but we wouldn't want to block for too long. For now,
-            // we'll just close the connection; the next acquire that finds the
-            // pool empty opens a new one.
+            // we'll just close the connection; its slot goes to a waiting task,
+            // which opens a new one, or else to the next acquire.
             conn.deinit();
             self._allocator.destroy(conn);
             self.dropSlot();
             return;
         }
 
-        var conns = self._conns;
         self._mutex.lockUncancelable(io);
-        const available = self._available;
-        conns[available] = conn;
-        self._available = available + 1;
+        self.give(.{ .conn = conn });
         self._mutex.unlock(io);
-        self._cond.signal(io);
     }
 
-    // Gives up a slot in _open and wakes a waiter, which can now open a
-    // connection in its place.
+    // Gives up a slot in _open. A waiting task gets it and opens a connection
+    // in its place.
     fn dropSlot(self: *Pool) void {
         const io = self._io;
         self._mutex.lockUncancelable(io);
-        self._open -= 1;
+        self.give(.slot);
         self._mutex.unlock(io);
-        self._cond.signal(io);
     }
 
     pub fn newListener(self: *Pool) !Listener {
@@ -511,6 +559,124 @@ test "Pool: a waiter opens a connection when a dirty one is released" {
     try expectStats(pool, .{ .size = 1, .available = 1, .missing = 0, .in_use = 0 });
 }
 
+test "Pool: a released connection goes to the waiting task, not a later one" {
+    const io = t.io;
+
+    var pool = try Pool.init(io, t.allocator, .{ .size = 1, .timeout = 200, .auth = t.authOpts(.{}) });
+    defer pool.deinit();
+
+    const c1 = try pool.acquire();
+
+    const S = struct {
+        fn run(p: *Pool) !*Conn {
+            return p.acquire();
+        }
+    };
+
+    var future = try io.concurrent(S.run, .{pool});
+    defer _ = future.cancel(io) catch null;
+    try waitForWaiters(pool, 1);
+
+    // released and immediately asked for again: the waiting task has it
+    pool.release(c1);
+    try t.expectError(error.Timeout, pool.acquire());
+
+    const c = try future.await(io);
+    try t.expectEqual(c1, c);
+    pool.release(c);
+}
+
+test "Pool: waiters are served in order, without the ones that gave up" {
+    const io = t.io;
+
+    var pool = try Pool.init(io, t.allocator, .{ .size = 1, .auth = t.authOpts(.{}) });
+    defer pool.deinit();
+
+    const c1 = try pool.acquire();
+
+    const Order = struct {
+        ids: [4]u8 = undefined,
+        len: std.atomic.Value(usize) = .init(0),
+    };
+    var order: Order = .{};
+
+    const S = struct {
+        fn run(p: *Pool, o: *Order, id: u8) !void {
+            const c = try p.acquire();
+            defer p.release(c);
+            o.ids[o.len.fetchAdd(1, .monotonic)] = id;
+        }
+    };
+
+    // queued as b, c, d, e; c (in the middle) and e (at the tail) give up
+    var b = try io.concurrent(S.run, .{ pool, &order, 'b' });
+    defer b.cancel(io) catch {};
+    try waitForWaiters(pool, 1);
+    var c = try io.concurrent(S.run, .{ pool, &order, 'c' });
+    defer c.cancel(io) catch {};
+    try waitForWaiters(pool, 2);
+    var d = try io.concurrent(S.run, .{ pool, &order, 'd' });
+    defer d.cancel(io) catch {};
+    try waitForWaiters(pool, 3);
+    var e = try io.concurrent(S.run, .{ pool, &order, 'e' });
+    defer e.cancel(io) catch {};
+    try waitForWaiters(pool, 4);
+
+    try t.expectError(error.Canceled, c.cancel(io));
+    try t.expectError(error.Canceled, e.cancel(io));
+    try waitForWaiters(pool, 2);
+
+    // queued after the tail was removed, so the list has to have been fixed up
+    var f = try io.concurrent(S.run, .{ pool, &order, 'f' });
+    defer f.cancel(io) catch {};
+    try waitForWaiters(pool, 3);
+
+    pool.release(c1);
+    try b.await(io);
+    try d.await(io);
+    try f.await(io);
+
+    try t.expectString("bdf", order.ids[0..order.len.load(.monotonic)]);
+    try expectStats(pool, .{ .size = 1, .available = 1, .missing = 0, .in_use = 0 });
+}
+
+test "Pool: a slot whose connection fails to open goes to the next waiter" {
+    const io = t.io;
+
+    var pool = try Pool.init(io, t.allocator, .{ .size = 1, .auth = t.authOpts(.{}) });
+    defer pool.deinit();
+
+    const c1 = try pool.acquire();
+
+    // bound but never listening, so connects are refused
+    const addr: Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    const socket = try addr.bind(io, .{ .mode = .stream });
+    defer socket.close(io);
+    pool._opts.connect.port = socket.address.ip4.port;
+
+    const S = struct {
+        fn run(p: *Pool) !void {
+            const c = try p.acquire();
+            p.release(c);
+        }
+    };
+
+    var b = try io.concurrent(S.run, .{pool});
+    defer b.cancel(io) catch {};
+    try waitForWaiters(pool, 1);
+    var c = try io.concurrent(S.run, .{pool});
+    defer c.cancel(io) catch {};
+    try waitForWaiters(pool, 2);
+
+    // the dirty connection's slot goes to b, whose connect fails, and from b
+    // to c, whose connect fails too
+    c1._state = .fail;
+    pool.release(c1);
+    try t.expectError(error.ConnectionRefused, b.await(io));
+    try t.expectError(error.ConnectionRefused, c.await(io));
+    try expectStats(pool, .{ .size = 1, .available = 0, .missing = 1, .in_use = 0 });
+}
+
 test "Pool: a canceled query doesn't reconnect in the canceled task" {
     const io = t.io;
 
@@ -795,6 +961,18 @@ fn forceReconnect(pool: *Pool) !void {
     const c2 = try pool.acquire();
     defer pool.release(c2);
     _ = try c2.exec("select 1", .{});
+}
+
+// Polls until `n` tasks are blocked in acquire.
+fn waitForWaiters(pool: *Pool, n: usize) !void {
+    for (0..2000) |_| {
+        pool._mutex.lockUncancelable(t.io);
+        const len = pool._waiters.len();
+        pool._mutex.unlock(t.io);
+        if (len == n) return;
+        try std.Io.sleep(t.io, .fromMilliseconds(1), .awake);
+    }
+    return error.TestTimeout;
 }
 
 fn expectStats(pool: *Pool, expected: Pool.Stats) !void {
