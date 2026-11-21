@@ -119,7 +119,7 @@ pub const Stream = struct {
         errdefer state.deinit();
 
         // a std.Io.Reader needs room for at least a message's 5 byte header
-        state.read_buf = try allocator.alloc(u8, @max(opts.read_buffer orelse 4096, 128));
+        state.read_buf = try allocator.alloc(u8, @max(opts.read_buffer orelse 8192, 128));
         state.socket_reader = socket.reader(io, state.read_buf);
         // Every write is a complete batch of messages, so the socket writer
         // needs no buffer of its own.
